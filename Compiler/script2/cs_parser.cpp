@@ -504,27 +504,36 @@ AGS::Parser::FuncCallpointMgr::CallpointInfo::CallpointInfo()
     : Callpoint(-1)
 { }
 
-AGS::Parser::MemoryLocation::MemoryLocation(Parser &parser)
+AGS::Parser::MarMgr::MarMgr(Parser &parser)
     : _parser(parser)
-    , _ScType (ScT::kNone)
+    , _scType (ScT::kNone)
     , _startOffs(0u)
     , _componentOffs (0u)
+{ }
+
+AGS::Parser::MarMgr& AGS::Parser::MarMgr::operator=(const MarMgr &other)
 {
+    if (&this->_parser != &other._parser)
+        _parser.InternalError("Illegal assignment");
+    this->_componentOffs = other._componentOffs;
+    this->_scType = other._scType;
+    this->_startOffs = other._startOffs;
+    return *this;
 }
 
-void AGS::Parser::MemoryLocation::SetStart(ScopeType type, size_t offset)
+void AGS::Parser::MarMgr::SetStart(ScopeType type, size_t offset)
 {
-    if (ScT::kNone != _ScType)
+    if (ScT::kNone != _scType)
         _parser.InternalError("Memory location object doubly initialized ");
 
-    _ScType = type;
+    _scType = type;
     _startOffs = offset;
     _componentOffs = 0;
 }
 
-void AGS::Parser::MemoryLocation::MakeMARCurrent(size_t lineno, ccCompiledScript &scrip)
+void AGS::Parser::MarMgr::MakeMARCurrent(size_t lineno, ccCompiledScript &scrip)
 {
-    switch (_ScType)
+    switch (_scType)
     {
     default:
         // The start offset is already reached (e.g., when a Dynpointer chain is dereferenced) 
@@ -562,39 +571,41 @@ void AGS::Parser::MemoryLocation::MakeMARCurrent(size_t lineno, ccCompiledScript
     Reset();
 }
 
-void AGS::Parser::MemoryLocation::Reset()
+void AGS::Parser::MarMgr::Reset()
 {
-    _ScType = ScT::kNone;
+    _scType = ScT::kNone;
     _startOffs = 0u;
     _componentOffs = 0u;
 }
 
-AGS::Parser::SetRegisterTracking::SetRegisterTracking(ccCompiledScript & scrip)
+AGS::Parser::RegisterTracking::RegisterTracking(ccCompiledScript &scrip)
     : _scrip(scrip)
+    , _tick(0u)
 {
     _register_list = std::vector<size_t>{ SREG_AX, SREG_BX, SREG_CX, SREG_DX, SREG_MAR };
     for (auto it = _register_list.begin(); it != _register_list.end(); it++)
-        _register[*it] = 0;
+        _register[*it] = 0u;
+    return;
 }
 
-void AGS::Parser::SetRegisterTracking::SetAllRegisters(void)
+void AGS::Parser::RegisterTracking::SetAllRegisters(void)
 {
     for (auto it = _register_list.begin(); it != _register_list.end(); it++)
         SetRegister(*it);
 }
 
-size_t AGS::Parser::SetRegisterTracking::GetGeneralPurposeRegister() const
+size_t AGS::Parser::RegisterTracking::GetGeneralPurposeRegister() const
 {
     size_t oldest_reg = INT_MAX;
-    CodeLoc oldest_loc = INT_MAX;
+    TickT oldest_tick = ULONG_MAX;
     for (auto it = _register_list.begin(); it != _register_list.end(); ++it)
     {
         if (*it == SREG_MAR)
             continue;
-        if (_register[*it] >= oldest_loc)
+        if (_register[*it] >= oldest_tick)
             continue;
         oldest_reg = *it;
-        oldest_loc = _register[*it];
+        oldest_tick = _register[*it];
     }
     return oldest_reg;
 }
@@ -603,6 +614,7 @@ AGS::Parser::Parser(SrcList &src, FlagSet options, ccCompiledScript &scrip, Symb
     : _nest(scrip)
     , _pp(PP::kPreAnalyze)
     , _reg_track(scrip)
+    , _marMgr(*this)
     , _sym(symt)
     , _src(src)
     , _options(options)
@@ -846,8 +858,9 @@ void AGS::Parser::FreeDynpointersOfAllLocals_DynResult(void)
     _reg_track.SetRegister(SREG_AX);
 
     RestorePoint rp_before_freeing(_scrip);
+    auto const tick_before_freeing = _reg_track.GetTick();
     FreeDynpointersOfLocals(0u);
-	bool const mar_clobbered = !_reg_track.IsValid(SREG_MAR, rp_before_freeing.CodeLocation());
+	bool const mar_clobbered = !_reg_track.IsValid(SREG_MAR, tick_before_freeing);
     bool const no_precautions_were_necessary = rp_before_freeing.IsEmpty();
 
     // Now release the dynamic pointer with a special opcode that prevents 
@@ -901,7 +914,9 @@ void AGS::Parser::HandleEndOfDo()
         kKW_While,
         _src.GetNext(),
         "Expected the 'while' of a 'do ... while(...)' statement");
-    ParseDelimitedExpression(_src, kKW_OpenParenthesis);
+    ExpressionResult xres;
+    ParseDelimitedExpression(_src, kKW_OpenParenthesis, xres);
+    CheckVartypeMismatch(xres.Vartype, kKW_Int, true, "In 'while' clause");
     Expect(kKW_Semicolon, _src.GetNext());
     
     // Jump back to the start of the loop while the condition is true
@@ -989,15 +1004,13 @@ Symbol AGS::Parser::ParseConstantExpression(SrcList &src, std::string const &msg
 
     Symbol const first_sym = src.PeekNext();
 
-    ValueLocation vloc;
-    ScopeType scope_type;
-    Vartype vartype;
-    ParseExpression(src, vloc, scope_type, vartype);
-    if (!vloc.IsCompileTimeLiteral())
+    ExpressionResult xres;
+    ParseExpression(src, xres);
+    if (xres.kTY_Literal != xres.Type)
         UserError(
         (msg + "Cannot evaluate the expression starting with '%s' at compile time").c_str(),
             _sym.GetName(first_sym).c_str());
-    return vloc.symbol;
+    return xres.Symbol;
 }
 
 // Must return a symbol that is a literal.
@@ -1718,7 +1731,7 @@ CodeCell AGS::Parser::GetOpcode(Symbol const op_sym, Vartype vartype1, Vartype v
         if (kKW_Null == vartype1 || kKW_Null == vartype2)
             // Don't use strings comparison against NULL: This will provoke a runtime error
             return _sym[op_sym].OperatorD->DynOpcode;
-
+		
         if (!iatos1)
             UserError("Can only compare 'null' or a string to another string");
         if (!iatos2)
@@ -1728,7 +1741,7 @@ CodeCell AGS::Parser::GetOpcode(Symbol const op_sym, Vartype vartype1, Vartype v
 
         if (SymbolTable::kNoOpcode == opcode)
             UserError("Cannot apply the operator '%s' to string values", _sym.GetName(op_sym).c_str());
-
+        
         return opcode;
     }
 
@@ -1939,49 +1952,84 @@ int AGS::Parser::GetWriteCommandForSize(int the_size)
     }
 }
 
-void AGS::Parser::HandleStructOrArrayResult(Vartype &vartype,Parser::ValueLocation &vloc)
+void AGS::Parser::HandleStructOrArrayResult(ExpressionResult &xres)
 {
+    Vartype const vartype = xres.Vartype;
+
     if (_sym.IsArrayVartype(vartype))
-        UserError("Cannot access array as a whole (did you forget to add \"[0]\"?)");
+        UserError("Cannot access this array as a whole (did you forget to add \"[0]\"?)");
 
     if (_sym.IsAtomicVartype(vartype) && _sym.IsStructVartype(vartype))
     {
         if (_sym.IsManagedVartype(vartype))
         {
             // Interpret the memory address as the result
-            vartype = _sym.VartypeWith(VTT::kDynpointer, vartype);
+            // We don't have a way of saying, "MAR _is_ the value"
+            // so we move the value to AX, we _can_ say "AX _is_ the value".
+            xres.Vartype = _sym.VartypeWith(VTT::kDynpointer, vartype);
+            _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
             WriteCmd(SCMD_REGTOREG, SREG_MAR, SREG_AX);
             _reg_track.SetRegister(SREG_AX);
-            vloc.location = ValueLocation::kAX_is_value;
+            xres.Location = xres.kLOC_AX;
             return;
         }
 
-        UserError("Cannot access non-managed struct as a whole");
+        UserError("Cannot access this non-managed struct as a whole");
     }
 }
 
-void AGS::Parser::ResultToAX(Vartype vartype, ValueLocation &vloc)
+void AGS::Parser::ExpressionResultToAx(ExpressionResult &xres)
 {
-    if (vloc.IsCompileTimeLiteral())
+    Vartype const vartype = xres.Vartype;
+
+    switch (xres.Type)
     {
-        WriteCmd(SCMD_LITTOREG, SREG_AX, _sym[vloc.symbol].LiteralD->Value);
+    default:
+        InternalError("Expression result has type %d, cannot move to AX", xres.Type);
+
+    case xres.kTY_FunctionName:
+        // Cannot convert a naked function symbol; assume that the coder has forgotten '('
+        UserError("Expected '(' after '%s'", _sym.GetName(xres.Symbol).c_str());
+
+    case xres.kTY_Literal:
+        // Convert to runtime value in AX
+        WriteCmd(SCMD_LITTOREG, SREG_AX, _sym[xres.Symbol].LiteralD->Value);
         _reg_track.SetRegister(SREG_AX);
         if (kKW_String == _sym.VartypeWithout(VTT::kConst, vartype))
             _scrip.FixupPrevious(kFx_String);
-        vloc.location = ValueLocation::kAX_is_value;        
+        xres.Type = xres.kTY_RunTimeValue;
+        xres.Location = xres.kLOC_AX;
+        xres.Symbol = kKW_NoSymbol;
+        break;
+
+    case xres.kTY_RunTimeValue:
+        break;
+
+    case xres.kTY_StructName:
+        // Cannot convert naked typename; coder has probably forgotten '.'
+        UserError("Expected '.' after '%s'", _sym.GetName(xres.Symbol).c_str());
     }
 
-    if (ValueLocation::kMAR_pointsto_value != vloc.location)
-        return; // So it's already in AX 
+    switch (xres.Location)
+    {
+    default:
+        return InternalError("Cannot move expression result location to AX");
 
-    if (kKW_String == _sym.VartypeWithout(VTT::kConst, vartype))
-        WriteCmd(SCMD_REGTOREG, SREG_MAR, SREG_AX);
-    else
-        WriteCmd(
-            _sym.IsDynVartype(vartype) ? SCMD_MEMREADPTR : GetReadCommandForSize(_sym.GetSize(vartype)),
-            SREG_AX);
-    _reg_track.SetRegister(SREG_AX);
-    vloc.location = ValueLocation::kAX_is_value;
+    case xres.kLOC_AX:
+        return; // Already done
+
+    case xres.kLOC_MARPointsToValue:
+        _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
+        if (kKW_String == _sym.VartypeWithout(VTT::kConst, xres.Vartype))
+            WriteCmd(SCMD_REGTOREG, SREG_MAR, SREG_AX);
+        else
+            WriteCmd(
+                _sym.IsDynVartype(vartype) ? SCMD_MEMREADPTR : GetReadCommandForSize(_sym.GetSize(vartype)),
+                SREG_AX);
+        _reg_track.SetRegister(SREG_AX);
+        xres.Location = ExpressionResult::kLOC_AX;
+        return;
+    }
 }
 
 void AGS::Parser::ParseExpression_CheckArgOfNew(Vartype argument_vartype)
@@ -1999,7 +2047,7 @@ void AGS::Parser::ParseExpression_CheckArgOfNew(Vartype argument_vartype)
     // allowed to use a built-in type with new[].
 }
 
-void AGS::Parser::ParseExpression_New(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_New(SrcList &expression, ExpressionResult &xres)
 {
     if (expression.ReachedEOF())
         UserError("Expected a type after 'new' but didn't find any");
@@ -2010,7 +2058,7 @@ void AGS::Parser::ParseExpression_New(SrcList &expression, ValueLocation &vloc, 
     bool const is_managed = _sym.IsManagedVartype(argument_vartype);
     bool const with_bracket_expr = !expression.ReachedEOF(); // "new FOO[BAR]"
 
-    Vartype element_vartype = 0;
+    Vartype element_vartype = kKW_NoSymbol;
     if (with_bracket_expr)
     {
         // Note that in AGS, you can write "new Struct[...]" but what you mean then is "new Struct*[...]".
@@ -2022,13 +2070,13 @@ void AGS::Parser::ParseExpression_New(SrcList &expression, ValueLocation &vloc, 
         if (kKW_OpenBracket != open_bracket)
             UserError("Unexpected '%s'", _sym.GetName(open_bracket).c_str());
 
-        ValueLocation bracketed_vloc;
-        ParseIntegerExpression(_src, bracketed_vloc);
-        ResultToAX(kKW_Int, bracketed_vloc);
+        ExpressionResult bracketed_xres;
+        ParseIntegerExpression(_src, bracketed_xres);
+        ExpressionResultToAx(bracketed_xres);
         Expect(kKW_CloseBracket, _src.GetNext());
 
         element_vartype = is_managed ? _sym.VartypeWith(VTT::kDynpointer, argument_vartype) : argument_vartype;
-        vartype = _sym.VartypeWith(VTT::kDynarray, element_vartype);
+        xres.Vartype = _sym.VartypeWith(VTT::kDynarray, element_vartype);
     }
     else
     {
@@ -2046,7 +2094,7 @@ void AGS::Parser::ParseExpression_New(SrcList &expression, ValueLocation &vloc, 
                 _sym.GetName(argument_vartype).c_str());
 
         element_vartype = argument_vartype;
-        vartype = _sym.VartypeWith(VTT::kDynpointer, argument_vartype);
+        xres.Vartype = _sym.VartypeWith(VTT::kDynpointer, argument_vartype);
     }
 
     size_t const element_size = _sym.GetSize(element_vartype);
@@ -2060,28 +2108,30 @@ void AGS::Parser::ParseExpression_New(SrcList &expression, ValueLocation &vloc, 
         WriteCmd(SCMD_NEWUSEROBJECT, SREG_AX, element_size);
     _reg_track.SetRegister(SREG_AX);
 
-    scope_type = ScT::kGlobal;
-    vloc.location = ValueLocation::kAX_is_value;
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = xres.kLOC_AX;
+    xres.Symbol = kKW_NoSymbol;
+    // Vartype has already been set
 }
 
 // We're parsing an expression that starts with '-' (unary minus)
-void AGS::Parser::ParseExpression_PrefixMinus(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_PrefixMinus(SrcList &expression, ExpressionResult &xres)
 {
-    if (vloc.IsCompileTimeLiteral())
+    if (xres.kTY_Literal == xres.Type)
     {
         // Do the operation right now
-        ValueLocation const vloc_lhs
-            = ValueLocation {
-                ValueLocation::kCompile_time_literal,
-                kKW_Float == _sym[vloc.symbol].LiteralD->Vartype? _sym.Find("0.0") : _sym.Find("0") };
-        bool can_do_it_now = false;
-        if(ParseExpression_CompileTime(kKW_Minus, vloc_lhs, vloc, vloc))
+        ExpressionResult xres_lhs;
+        xres_lhs.Type = xres.kTY_Literal;
+        xres_lhs.Location = xres.kLOC_Symbol;
+        xres_lhs.Vartype = _sym[xres.Symbol].LiteralD->Vartype;
+        xres_lhs.Symbol = kKW_Float == xres_lhs.Vartype ? _sym.Find("0.0") : _sym.Find("0");
+        if (ParseExpression_CompileTime(kKW_Minus, xres_lhs, xres, xres))
             return;
     }
 
-    ResultToAX(vartype, vloc);
+    ExpressionResultToAx(xres);
 
-    CodeCell const opcode = GetOpcode(kKW_Minus, vartype, vartype);
+    CodeCell const opcode = GetOpcode(kKW_Minus, xres.Vartype, xres.Vartype);
     
     // Calculate 0 - AX
     // The binary representation of 0.0 is identical to the binary representation of 0
@@ -2091,41 +2141,44 @@ void AGS::Parser::ParseExpression_PrefixMinus(SrcList &expression, ValueLocation
     WriteCmd(SCMD_REGTOREG, SREG_BX, SREG_AX);
     _reg_track.SetRegister(SREG_BX);
     _reg_track.SetRegister(SREG_AX);
-    vloc.location = ValueLocation::kAX_is_value;
+    xres.Symbol = kKW_NoSymbol;
+    xres.Modifiable = false;
 }
 
 // We're parsing an expression that starts with '+' (unary plus)
-void AGS::Parser::ParseExpression_PrefixPlus(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_PrefixPlus(SrcList &expression, ExpressionResult &xres)
 {
     expression.StartRead();
     
-    ParseExpression_Term(expression, vloc, scope_type, vartype);
+    ParseExpression_Term(expression, xres);
     
-    if (_sym.IsAnyIntegerVartype(vartype) || kKW_Float == vartype)
+    if (_sym.IsAnyIntegerVartype(xres.Vartype) || kKW_Float == xres.Vartype)
         return;
 
-    UserError("Cannot apply unary '+' to an expression of type '%s'", _sym.GetName(vartype));
+    UserError("Cannot apply unary '+' to an expression of type '%s'", _sym.GetName(xres.Vartype));
 }
 
 // We're parsing an expression that starts with '!' (boolean NOT) or '~' (bitwise Negate)
-void AGS::Parser::ParseExpression_PrefixNegate(Symbol op_sym, SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_PrefixNegate(Symbol op_sym, SrcList &expression, ExpressionResult &xres)
 {
     bool const bitwise_negation = kKW_BitNeg == op_sym;
 
     std::string msg = "Argument of '<op>'";
     msg.replace(msg.find("<op>"), 4, _sym.GetName(op_sym));
-    CheckVartypeMismatch(vartype, kKW_Int, true, msg);
+    CheckVartypeMismatch(xres.Vartype, kKW_Int, true, msg);
     
-    if (vloc.IsCompileTimeLiteral())
+    if (xres.kTY_Literal == xres.Type)
     {
         // Try to do the negation now
-        ValueLocation const vloc_lhs = { ValueLocation::kCompile_time_literal, _sym.Find("0") };
-        bool can_do_it_now = false;
-        if (ParseExpression_CompileTime(op_sym, vloc_lhs, vloc, vloc))
+        ExpressionResult xres_lhs;
+        xres_lhs.Type = xres.kTY_Literal;
+        xres_lhs.Location = xres.kLOC_Symbol;
+        xres_lhs.Symbol = _sym.Find("0");
+        if (ParseExpression_CompileTime(op_sym, xres_lhs, xres, xres))
             return;
     }
 
-    ResultToAX(vartype, vloc);
+    ExpressionResultToAx(xres);
     
     if (bitwise_negation)
     {
@@ -2142,21 +2195,21 @@ void AGS::Parser::ParseExpression_PrefixNegate(Symbol op_sym, SrcList &expressio
         _reg_track.SetRegister(SREG_AX);
     }
 
-    vartype = kKW_Int;
-    vloc.location = ValueLocation::kAX_is_value;
+    xres.Vartype = kKW_Int;
+    xres.Location = ExpressionResult::kLOC_AX;
 }
 
-void AGS::Parser::ParseExpression_PrefixModifier(Symbol op_sym, AGS::SrcList &expression, AGS::Parser::ValueLocation &vloc, AGS::ScopeType &scope_type, AGS::Vartype &vartype)
+void AGS::Parser::ParseExpression_PrefixCrement(Symbol op_sym, AGS::SrcList &expression, ExpressionResult &xres)
 {
     bool const op_is_inc = (kKW_Increment == op_sym);
 
     expression.StartRead();
 
-    ParseAssignment_ReadLHSForModification(expression, scope_type, vloc, vartype);
+    ParseAssignment_ReadLHSForModification(expression, xres);
     
     std::string msg = "Argument of '<op>'";
     msg.replace(msg.find("<op>"), 4, _sym.GetName(op_sym).c_str());
-    CheckVartypeMismatch(vartype, kKW_Int, true, msg); 
+    CheckVartypeMismatch(xres.Vartype, kKW_Int, true, msg); 
     
     WriteCmd((op_is_inc ? SCMD_ADD : SCMD_SUB), SREG_AX, 1);
     _reg_track.SetRegister(SREG_AX);
@@ -2165,20 +2218,21 @@ void AGS::Parser::ParseExpression_PrefixModifier(Symbol op_sym, AGS::SrcList &ex
     // If a shortcut is possible then undo this and generate the shortcut instead.
     RestorePoint before_long_way_modification = RestorePoint(_scrip);
 
-    AccessData_AssignTo(scope_type, vartype, expression);
+    AccessData_AssignTo(expression, xres);
     
-    if (ValueLocation::kMAR_pointsto_value == vloc.location)
+    if (ExpressionResult::kLOC_MARPointsToValue == xres.Location)
     {
         before_long_way_modification.Restore();
-        CodeCell memwrite = GetWriteCommandForSize(_sym.GetSize(vartype));
+        CodeCell memwrite = GetWriteCommandForSize(_sym.GetSize(xres.Vartype));
         WriteCmd(memwrite, SREG_AX);
         _reg_track.SetRegister(SREG_AX);
     }
+    xres.SideEffects = true;
 }
 
 // The least binding operator is the first thing in the expression
 // This means that the op must be an unary op.
-void AGS::Parser::ParseExpression_Prefix(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_Prefix(SrcList &expression, ExpressionResult &xres)
 {
     Symbol const op_sym = expression[0];
 
@@ -2190,27 +2244,27 @@ void AGS::Parser::ParseExpression_Prefix(SrcList &expression, ValueLocation &vlo
     expression.EatFirstSymbol();
 
     if (kKW_New == op_sym)
-        return ParseExpression_New(expression, vloc, scope_type, vartype);
+        return ParseExpression_New(expression, xres);
 
     if (kKW_Decrement == op_sym || kKW_Increment == op_sym)
     {
         StripOutermostParens(expression);
-        return ParseExpression_PrefixModifier(op_sym, expression, vloc, scope_type, vartype);
+        return ParseExpression_PrefixCrement(op_sym, expression, xres);
     }
 
-    ParseExpression_Term(expression, vloc, scope_type, vartype);
+    ParseExpression_Term(expression, xres);
     
     switch (op_sym)
     {
     case kKW_BitNeg:
     case kKW_Not:
-        return ParseExpression_PrefixNegate(op_sym, expression, vloc, scope_type, vartype);
+        return ParseExpression_PrefixNegate(op_sym, expression, xres);
 
     case kKW_Minus:
-        return ParseExpression_PrefixMinus(expression, vloc, scope_type, vartype);
+        return ParseExpression_PrefixMinus(expression, xres);
 
     case kKW_Plus:
-        return ParseExpression_PrefixPlus(expression, vloc, scope_type, vartype);
+        return ParseExpression_PrefixPlus(expression, xres);
     }
 
     InternalError("Illegal prefix op '%s'", _sym.GetName(op_sym).c_str());
@@ -2232,18 +2286,18 @@ void AGS::Parser::StripOutermostParens(SrcList &expression)
     }
 }
 
-void AGS::Parser::ParseExpression_PostfixModifier(Symbol const op_sym, SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_PostfixCrement(Symbol const op_sym, SrcList &expression, ExpressionResult &xres)
 {
     bool const op_is_inc = kKW_Increment == op_sym;
 
     StripOutermostParens(expression);
     expression.StartRead();
 
-    ParseAssignment_ReadLHSForModification(expression, scope_type, vloc, vartype);
+    ParseAssignment_ReadLHSForModification(expression, xres);
     
     std::string msg = "Argument of '<op>'";
     msg.replace(msg.find("<op>"), 4, _sym.GetName(op_sym).c_str());
-    CheckVartypeMismatch(vartype, kKW_Int, true, msg);
+    CheckVartypeMismatch(xres.Vartype, kKW_Int, true, msg);
     
     // Really do the assignment the long way so that all the checks and safeguards will run.
     // If a shortcut is possible then undo this and generate the shortcut instead.
@@ -2251,22 +2305,23 @@ void AGS::Parser::ParseExpression_PostfixModifier(Symbol const op_sym, SrcList &
 
     PushReg(SREG_AX);
     WriteCmd((op_is_inc ? SCMD_ADD : SCMD_SUB), SREG_AX, 1);
-    AccessData_AssignTo(scope_type, vartype, expression);
+    AccessData_AssignTo(expression, xres);
     PopReg(SREG_AX);
 
-    if (ValueLocation::kMAR_pointsto_value == vloc.location)
+    if (ExpressionResult::kLOC_MARPointsToValue == xres.Location)
     {   // We know the memory where the var resides. Do modify this memory directly.
         before_long_way_modification.Restore();
         WriteCmd((op_is_inc ? SCMD_ADD : SCMD_SUB), SREG_AX, 1);
-        CodeCell memwrite = GetWriteCommandForSize(_sym.GetSize(vartype));
+        CodeCell memwrite = GetWriteCommandForSize(_sym.GetSize(xres.Vartype));
         WriteCmd(memwrite, SREG_AX);
         WriteCmd((!op_is_inc ? SCMD_ADD : SCMD_SUB), SREG_AX, 1);
         _reg_track.SetRegister(SREG_AX);
     }
-    vloc.location = ValueLocation::kAX_is_value;
+    xres.Location = ExpressionResult::kLOC_AX;
+    xres.SideEffects = true;
 }
 
-void AGS::Parser::ParseExpression_Postfix(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_Postfix(SrcList &expression, ExpressionResult &xres, bool result_used)
 {
     size_t const len = expression.Length();
 
@@ -2283,34 +2338,34 @@ void AGS::Parser::ParseExpression_Postfix(SrcList &expression, ValueLocation &vl
     {
     case kKW_Decrement:
     case kKW_Increment:
-        return ParseExpression_PostfixModifier(op_sym, expression, vloc, scope_type, vartype);
+        // If the result isn't used then take the more efficient version of increment / decrement
+        return result_used ?
+            ParseExpression_PostfixCrement(op_sym, expression, xres) : ParseExpression_PrefixCrement(op_sym, expression, xres);
     }
 
     UserError("Expected a term following the '%s', didn't find it", _sym.GetName(op_sym).c_str());
 }
 
-void AGS::Parser::ParseExpression_Ternary_Term2(ValueLocation const &vloc_term1, ScopeType scope_type_term1, Vartype vartype_term1, bool term1_has_been_ripped_out, SrcList &term2, ValueLocation &vloc, AGS::ScopeType &scope_type, AGS::Vartype &vartype)
+void AGS::Parser::ParseExpression_Ternary_Term2(ExpressionResult &xres_term1, bool term1_has_been_ripped_out, SrcList &term2, ExpressionResult &xres, bool result_used)
 {
     bool const second_term_exists = (term2.Length() > 0);
     if (second_term_exists)
     {
-        ParseExpression_Term(term2, vloc, scope_type, vartype);
+        ParseExpression_Term(term2, xres, result_used);
         if (!term2.ReachedEOF())
             InternalError("Unexpected '%s' after 1st term of ternary", _sym.GetName(term2.GetNext()).c_str());
 
-        ValueLocation vloc_dummy = vloc;
-        ResultToAX(vartype, vloc_dummy); // don't clobber vloc
+        ExpressionResult xres_dummy = xres;
+        ExpressionResultToAx(xres_dummy); // don't clobber xres
     }
     else
     {
         // Take the first expression as the result of the missing second expression
-        vartype = vartype_term1;
-        scope_type = scope_type_term1;
-        vloc = vloc_term1;
+        xres = xres_term1;
         if (term1_has_been_ripped_out)
         {   // Still needs to be moved to AX
-            ValueLocation vloc_dummy = vloc;
-            ResultToAX(vartype, vloc_dummy); // Don't clobber vloc
+            ExpressionResult xres_dummy = xres;
+            ExpressionResultToAx(xres_dummy); // don't clobber xres
         }
     }
 
@@ -2319,10 +2374,10 @@ void AGS::Parser::ParseExpression_Ternary_Term2(ValueLocation const &vloc_term1,
     // term3 will evaluate to a 'string', and we need to generate code here,
     // so to be on the safe side, convert any 'string' into 'String'.
     // Note that the result of term2 has already been moved to AX
-    ConvertAXStringToStringObject(_sym.GetStringStructPtrSym(), vartype);
+    ConvertAXStringToStringObject(_sym.GetStringStructPtrSym(), xres.Vartype);
 }
 
-void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, ExpressionResult &xres, bool result_used)
 {
     // First term ends before the '?'
     SrcList term1 = SrcList(expression, 0, tern_idx);
@@ -2349,9 +2404,7 @@ void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, 
 
     bool const second_term_exists = (term2.Length() > 0);
 
-    ValueLocation vloc_term1, vloc_term2, vloc_term3;
-    ScopeType scope_type_term1, scope_type_term2, scope_type_term3;
-    Vartype vartype_term1, vartype_term2, vartype_term3;
+    ExpressionResult xres_term1, xres_term2, xres_term3;
 
     // Note: Cannot use the same jump-collector for the end of term1
     // and the end of term2 although both jump to the same destination,
@@ -2367,14 +2420,15 @@ void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, 
 
 
     // First term of ternary (i.e, the test of the ternary)
-    ParseExpression_Term(term1, vloc_term1, scope_type_term1, vartype_term1);
+    // Result is used, that's the point of the ternary
+    ParseExpression_Term(term1, xres_term1);
     
     bool const term1_known =
-        ValueLocation::kCompile_time_literal == vloc_term1.location &&
-        (vartype_term1 == kKW_Float || _sym.IsAnyIntegerVartype(vartype_term1));
-    CodeCell const term1_value = term1_known ? _sym[vloc_term1.symbol].LiteralD->Value : false;
-    ValueLocation vloc_dummy = vloc_term1;
-    ResultToAX(vartype_term1, vloc_dummy); // Don't clobber vloc_term1
+        xres.kTY_Literal ==  xres_term1.Type &&
+        (xres_term1.Vartype == kKW_Float || _sym.IsAnyIntegerVartype(xres_term1.Vartype));
+    CodeCell const term1_value = term1_known ? _sym[xres_term1.Symbol].LiteralD->Value : false;
+    ExpressionResult xres_dummy = xres_term1;
+    ExpressionResultToAx(xres_dummy); // Don't clobber vloc_term1
    
     if (!term1.ReachedEOF())
         InternalError("Unexpected '%s' after 1st term of ternary", _sym.GetName(term1.GetNext()).c_str());
@@ -2398,9 +2452,9 @@ void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, 
     // Second term of the ternary
     RestorePoint start_of_term2(_scrip);
     ParseExpression_Ternary_Term2(
-        vloc_term1, scope_type_term1, vartype_term1,
-        term1_has_been_ripped_out,
-        term2, vloc_term2, scope_type_term2, vartype_term2);
+        xres_term1, term1_has_been_ripped_out,
+        term2, xres_term2,
+        result_used);
     
     // Needs to be here so that the jump after term2 is ripped out whenever
     // term3 is ripped out so there isn't any term that would need to be jumped over.
@@ -2421,15 +2475,15 @@ void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, 
     // Third term of ternary
     jumpdest_to_term3.Patch(_src.GetLineno());
 
-    ParseExpression_Term(term3, vloc_term3, scope_type_term3, vartype_term3);
-    vloc_dummy = vloc_term3;
-    ResultToAX(vartype_term3, vloc_dummy); // don't clobber vloc_term3
-    ConvertAXStringToStringObject(_sym.GetStringStructPtrSym(), vartype_term3);
+    ParseExpression_Term(term3, xres_term3, result_used);
+    xres_dummy = xres_term3;
+    ExpressionResultToAx(xres_dummy); // don't clobber vloc_term3
+    ConvertAXStringToStringObject(_sym.GetStringStructPtrSym(), xres_term3.Vartype);
 
     bool term3_has_been_ripped_out = false;
     if (term1_known && term1_value)
     {
-         start_of_term3.Restore(); // Don't need term3, will never be evaluated
+        start_of_term3.Restore(); // Don't need term3, will never be evaluated
         term3_has_been_ripped_out = true;
     }
 
@@ -2437,43 +2491,44 @@ void AGS::Parser::ParseExpression_Ternary(size_t tern_idx, SrcList &expression, 
         jumpdest_after_term2.Patch(_src.GetLineno());
     jumpdest_out_of_ternary.Patch(_src.GetLineno());
 
-    scope_type =
-        (ScT::kLocal == scope_type_term2 || ScT::kLocal == scope_type_term3) ?
-        ScT::kLocal : ScT::kGlobal;
+    xres.LocalNonParameter = 
+        xres_term2.LocalNonParameter || xres_term3.LocalNonParameter;
 
-    vartype = vartype_term2;
-    if (IsVartypeMismatch_Oneway(vartype_term3, vartype_term2))
+    xres.Vartype = xres_term2.Vartype;
+    if (IsVartypeMismatch_Oneway(xres_term3.Vartype, xres_term2.Vartype))
     {
-        if (IsVartypeMismatch_Oneway(vartype_term2, vartype_term3))
+        if (IsVartypeMismatch_Oneway(xres_term2.Vartype, xres_term3.Vartype))
         {
             expression.SetCursor(tern_idx);
             UserError("An expression of type '%s' is incompatible with an expression of type '%s'",
-                _sym.GetName(vartype_term2).c_str(), _sym.GetName(vartype_term3).c_str());
+                _sym.GetName(xres_term2.Vartype).c_str(), _sym.GetName(xres_term3.Vartype).c_str());
         }
-        vartype = vartype_term3;
+        xres.Vartype = xres_term3.Vartype;
     }
 
     if (term1_known)
     {
-        if (term1_value && ValueLocation::kCompile_time_literal == vloc_term2.location)
+        if (term1_value && ExpressionResult::kTY_Literal == xres_term2.Type)
         {
             start_of_term1.Restore(); // Don't need the ternary at all
-            vloc = vloc_term2;
+            xres = xres_term2;
             return;
         }
-        if (!term1_value && ValueLocation::kCompile_time_literal == vloc_term3.location)
+        if (!term1_value && ExpressionResult::kTY_Literal == xres_term3.Type)
         {
             start_of_term1.Restore(); // Don't need the ternary at all
-            vloc = vloc_term3;
+            xres = xres_term3;
             return;
         }
     }
 
     // Each branch has been putting the result into AX so that's where it's now
-    vloc.location = ValueLocation::kAX_is_value;
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = ExpressionResult::kLOC_AX;
+    xres.Modifiable = false;
 }
 
-void AGS::Parser::ParseExpression_Binary(size_t op_idx, SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_Binary(size_t op_idx, SrcList &expression, ExpressionResult &xres)
 {
     RestorePoint start_of_term(_scrip);
     Symbol const operator_sym = expression[op_idx];
@@ -2481,11 +2536,11 @@ void AGS::Parser::ParseExpression_Binary(size_t op_idx, SrcList &expression, Val
     // Process the left hand side
     // This will be in vain if we find out later on that there isn't any right hand side,
     // but doing the left hand side first means that any errors will be generated from left to right
-    Vartype vartype_lhs = kKW_NoSymbol;
     SrcList lhs = SrcList(expression, 0u, op_idx);
-    ParseExpression_Term(lhs, vloc, scope_type, vartype_lhs);
-    ValueLocation vloc_lhs = vloc; // Save original value location before moving the result into AX    
-    ResultToAX(vartype_lhs, vloc);
+    ParseExpression_Term(lhs, xres);
+
+    ExpressionResult xres_lhs = xres;
+    ExpressionResultToAx(xres);
    
     ForwardJump to_exit(_scrip);
     
@@ -2512,52 +2567,52 @@ void AGS::Parser::ParseExpression_Binary(size_t op_idx, SrcList &expression, Val
         // there is no right hand side for the expression
         UserError("Binary operator '%s' doesn't have a right hand side", _sym.GetName(operator_sym).c_str());
 
-    ParseExpression_Term(rhs, vloc, scope_type, vartype);
-    ValueLocation vloc_rhs = vloc; // Save original value location before moving the result into AX 
-    ResultToAX(vartype, vloc);
+    ParseExpression_Term(rhs, xres);
+
+    ExpressionResult xres_rhs = xres;
+    ExpressionResultToAx(xres);
 
     PopReg(SREG_BX); // Note, we pop to BX although we have pushed AX
     _reg_track.SetRegister(SREG_BX);
     // now the result of the left side is in BX, of the right side is in AX
 
-    CodeCell const opcode = GetOpcode(operator_sym, vartype_lhs, vartype);
+    CodeCell const opcode = GetOpcode(operator_sym, xres_lhs.Vartype, xres_rhs.Vartype);
     
     WriteCmd(opcode, SREG_BX, SREG_AX);
     WriteCmd(SCMD_REGTOREG, SREG_BX, SREG_AX);
     _reg_track.SetRegister(SREG_BX);
     _reg_track.SetRegister(SREG_AX);
-    vloc.location = ValueLocation::kAX_is_value;
+    xres.Location = ExpressionResult::kLOC_AX;
 
     to_exit.Patch(_src.GetLineno());
 
     if (_sym.IsBooleanOperator(operator_sym))
-        vartype = kKW_Int;
+        xres.Vartype = kKW_Int;
 
-    if (!vloc_lhs.IsCompileTimeLiteral() || !vloc_rhs.IsCompileTimeLiteral())
+    if (xres.kTY_Literal != xres_lhs.Type || xres.kTY_Literal != xres_rhs.Type)
         return;
 
     // Attempt to do this at compile-time
 
     if (kKW_And == operator_sym || kKW_Or == operator_sym)
     {
-        bool const left = (0 != _sym[vloc_lhs.symbol].LiteralD->Value);
+        bool const left = (0 != _sym[xres_lhs.Symbol].LiteralD->Value);
         if (kKW_And == operator_sym)
-            vloc = left ? vloc_rhs : vloc_lhs;
-        else 
-            vloc = left ? vloc_lhs : vloc_rhs;
+            xres = left ? xres_rhs : xres_lhs;
+        else // kKW_Or
+            xres = left ? xres_lhs : xres_rhs;
         
-        if (!_sym.IsAnyIntegerVartype(_sym[vloc.symbol].LiteralD->Vartype))
+        if (!_sym.IsAnyIntegerVartype(_sym[xres.Symbol].LiteralD->Vartype))
         {   // Swap an int literal in (note: Don't change the vartype of the pre-existing literal)
-            bool const result = (0 != _sym[vloc.symbol].LiteralD->Value);
-            vloc.symbol = result ? _sym.Find("1") : _sym.Find("0");
+            bool const result = (0 != _sym[xres.Symbol].LiteralD->Value);
+            xres.Symbol = result ? _sym.Find("1") : _sym.Find("0");
         }
 
         start_of_term.Restore();
         return;
     }
  
-    bool done_at_compile_time = false;
-    if (ParseExpression_CompileTime(operator_sym, vloc_lhs, vloc_rhs, vloc))
+    if (ParseExpression_CompileTime(operator_sym, xres_lhs, xres_rhs, xres))
         start_of_term.Restore();
 }
 
@@ -2579,7 +2634,7 @@ void AGS::Parser::ParseExpression_CheckUsedUp(SrcList &expression)
         _sym.GetName(expression.GetNext()).c_str());
 }
 
-void AGS::Parser::ParseExpression_InParens(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_InParens(SrcList &expression, ExpressionResult &xres, bool result_used)
 {
     // Check for spurious symbols after the closing paren.
     expression.SetCursor(1u);
@@ -2588,7 +2643,7 @@ void AGS::Parser::ParseExpression_InParens(SrcList &expression, ValueLocation &v
     ParseExpression_CheckUsedUp(expression);
     
     StripOutermostParens(expression);
-    return ParseExpression_Term(expression, vloc, scope_type, vartype);
+    return ParseExpression_Term(expression, xres, result_used);
 }
 
 // We're in the parameter list of a function call, and we have less parameters than declared.
@@ -2683,29 +2738,27 @@ void AGS::Parser::AccessData_FunctionCall_PushParams(SrcList &parameters, size_t
             InternalError("Parameter length is negative");
 
         // Compile the parameter
-        ValueLocation vloc;
-        ScopeType scope_type;
-        Vartype vartype;
+        ExpressionResult xres;
 
         SrcList current_param = SrcList(parameters, start_of_current_param, end_of_current_param - start_of_current_param);
-        ParseExpression_Term(current_param, vloc, scope_type, vartype);
-        ResultToAX(vartype, vloc);
+        ParseExpression_Term(current_param, xres);
+        ExpressionResultToAx(xres);
 
         if (param_num <= num_func_args) // we know what type to expect
         {
             // If we need a string object ptr but AX contains a normal string, convert AX
             Vartype const param_vartype = _sym[funcSymbol].FunctionD->Parameters[param_num].Vartype;
-            ConvertAXStringToStringObject(param_vartype, vartype);
+            ConvertAXStringToStringObject(param_vartype, xres.Vartype);
             // If we need a normal string but AX contains a string object ptr, 
             // check that this ptr isn't null
-            if (_sym.GetStringStructSym() == _sym.VartypeWithout(VTT::kDynpointer, vartype) &&
+            if (_sym.GetStringStructSym() == _sym.VartypeWithout(VTT::kDynpointer, xres.Vartype) &&
                 kKW_String == _sym.VartypeWithout(VTT::kConst, param_vartype))
                 WriteCmd(SCMD_CHECKNULLREG, SREG_AX);
 
             std::string msg = "Parameter #<num> of call to function <func>";
             msg.replace(msg.find("<num>"), 5, std::to_string(param_num));
             msg.replace(msg.find("<func>"), 6, _sym.GetName(funcSymbol));
-            CheckVartypeMismatch(vartype, param_vartype, true, msg);
+            CheckVartypeMismatch(xres.Vartype, param_vartype, true, msg);
         }
 
         // Note: We push the parameters, which is tantamount to writing them
@@ -2821,10 +2874,10 @@ void AGS::Parser::AccessData_GenerateFunctionCall(Symbol name_of_func, size_t nu
     }
 }
 
-void AGS::Parser::AccessData_GenerateDynarrayLengthFuncCall(MemoryLocation &mloc, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::AccessData_GenerateDynarrayLengthFuncCall(ExpressionResult &xres)
 {
     // Load MAR with the address of the dynarray. Will provoke a runtime error when NULL
-    AccessData_Dereference(vloc, mloc);
+    AccessData_Dereference(xres);
 
     // We calculate the length of the dynarray by calling an external function.
     // Ensure that this function is declared as an import function
@@ -2838,7 +2891,7 @@ void AGS::Parser::AccessData_GenerateDynarrayLengthFuncCall(MemoryLocation &mloc
         bool const body_follows = false;
         ParseFuncdecl_MasterData2Sym(tqs, kKW_Int, no_struct, dynarray_len_func, body_follows);
         _sym[dynarray_len_func].FunctionD->Parameters.push_back({});
-        _sym[dynarray_len_func].FunctionD->Parameters[1u].Vartype = vartype;
+        _sym[dynarray_len_func].FunctionD->Parameters[1u].Vartype = xres.Vartype;
         _sym[dynarray_len_func].FunctionD->Offset = _scrip.FindOrAddImport(_sym.GetName(dynarray_len_func));
         strcat(_scrip.imports[_sym[dynarray_len_func].FunctionD->Offset], "^1");
         _sym.SetDeclared(dynarray_len_func, _src.GetCursor());
@@ -2848,9 +2901,11 @@ void AGS::Parser::AccessData_GenerateDynarrayLengthFuncCall(MemoryLocation &mloc
     WriteCmd(SCMD_PUSHREAL, SREG_MAR); // Load the dynarray address onto the far stack
     AccessData_GenerateFunctionCall(dynarray_len_func, 1u, true);
 
-    vloc.location = ValueLocation::kAX_is_value;
-    scope_type = ScT::kGlobal;
-    vartype = kKW_Int;
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = xres.kLOC_AX;
+    xres.Symbol = kKW_NoSymbol;
+    xres.Vartype = kKW_Int;
+    xres.Modifiable = false;
 }
 
 // We are processing a function call.
@@ -2884,7 +2939,7 @@ void AGS::Parser::AccessData_PushFunctionCallParams(Symbol name_of_func, bool fu
     parameters.SetCursor(closed_paren_idx + 1); // Go to the end of the parameter list
 }
 
-void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expression, MemoryLocation &mloc, Vartype &rettype)
+void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expression, ExpressionResult &xres)
 {
     if (kKW_OpenParenthesis != expression[1])
         UserError("Expected '('");
@@ -2914,7 +2969,7 @@ void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expressi
     if (called_func_uses_this)
     {
         // MAR contains the address of "outer"; this is what will be used for "this" in the called function.
-        mloc.MakeMARCurrent(_src.GetLineno(), _scrip);
+        _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
         _reg_track.SetRegister(SREG_MAR);
 
         // Parameter processing might entail calling yet other functions, e.g., in "f(...g(x)...)".
@@ -2948,8 +3003,12 @@ void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expressi
 
     AccessData_GenerateFunctionCall(name_of_func, num_args, func_is_import);
 
-    // function return type
-    rettype = _sym.FuncReturnVartype(name_of_func);
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = xres.kLOC_AX;
+    xres.Symbol = kKW_NoSymbol;
+    xres.Vartype = _sym.FuncReturnVartype(name_of_func);
+    xres.SideEffects = true; // A function call is a side effect
+    xres.Modifiable = false;
 
     if (mar_pushed)
     {
@@ -2962,140 +3021,71 @@ void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expressi
     MarkAcessed(name_of_func);
 }
 
-bool AGS::Parser::ParseExpression_CompileTime(Symbol const op_sym, ValueLocation const &vloc_lhs, ValueLocation const &vloc_rhs, ValueLocation &vloc)
+bool AGS::Parser::ParseExpression_CompileTime(Symbol const op_sym, ExpressionResult const &xres_lhs, ExpressionResult const &xres_rhs, ExpressionResult &xres)
 {
-    Vartype const vartype_lhs = _sym[vloc_lhs.symbol].LiteralD->Vartype;
-    Vartype const vartype_rhs = _sym[vloc_rhs.symbol].LiteralD->Vartype;
-    Vartype vartype;
-    if (kKW_Float == vartype_lhs)
-    {
-        if (kKW_Float != vartype_rhs)
-            return false;
-        vartype = kKW_Float;
-    }
-    else if (_sym.IsAnyIntegerVartype(vartype_lhs))
-    {
-        if (!_sym.IsAnyIntegerVartype(vartype_rhs))
-            return false;
-        vartype = kKW_Int;
-    }
-    else
-    {
-        return false;
-    }
+    Vartype const vartype_lhs = _sym[xres_lhs.Symbol].LiteralD->Vartype;
+    Vartype const vartype_rhs = _sym[xres_rhs.Symbol].LiteralD->Vartype;
 
-    CompileTimeFunc *const ctf =
-        (kKW_Float == vartype) ? _sym[op_sym].OperatorD->FloatCTFunc :
-        (kKW_Int == vartype) ?   _sym[op_sym].OperatorD->IntCTFunc :
-        nullptr;
+    CompileTimeFunc *ctf;
+    if ((kKW_Float == vartype_lhs) && (kKW_Float == vartype_rhs))
+        ctf = _sym[op_sym].OperatorD->FloatCTFunc;
+    else if (_sym.IsAnyIntegerVartype(vartype_lhs) && _sym.IsAnyIntegerVartype(vartype_rhs))
+        ctf = _sym[op_sym].OperatorD->IntCTFunc;
+    else
+        return false;
+
     if (nullptr == ctf)
         return false;
+
+    Symbol symbol;
     try
     {
-        ctf->Evaluate(vloc_lhs.symbol, vloc_rhs.symbol, vloc.symbol);
+        ctf->Evaluate(xres_lhs.Symbol, xres_rhs.Symbol, symbol);
     }
     catch (CompileTimeFunc::CompileTimeError &e)
     {
         UserError(e.what());
     }
-    vloc.location = ValueLocation::kCompile_time_literal;
+
+    xres.Type = xres.kTY_Literal;
+    xres.Location = xres.kLOC_Symbol;
+    xres.Symbol = symbol;
+    xres.Vartype = _sym.IsBooleanOperator(op_sym) ? kKW_Int : vartype_lhs;
     return true;
 }
 
-void AGS::Parser::ParseExpression_NoOps(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression_NoOps(SrcList &expression, ExpressionResult &xres, bool result_used)
 {
     if (kKW_OpenParenthesis == expression[0])
-        return ParseExpression_InParens(expression, vloc, scope_type, vartype);
+        return ParseExpression_InParens(expression, xres, result_used);
 
-    AccessData(VAC::kReading, expression, vloc, scope_type, vartype);
+    AccessData(VAC::kReading, expression, xres);
     return ParseExpression_CheckUsedUp(expression);
 }
 
-void AGS::Parser::ParseSideEffectExpression(SrcList &expression)
+void AGS::Parser::ParseExpression_Term(SrcList &expression, ExpressionResult &xres, bool result_used)
 {
     if (expression.Length() == 0)
         InternalError("Cannot parse empty subexpression");
-
-    ValueLocation vloc;
-    ScopeType scope_type;
-    Vartype vartype;
 
     int const least_binding_op_idx = IndexOfLeastBondingOperator(expression);  // can be < 0
     
-    Symbol const op_sym = expression[least_binding_op_idx];
-
     if (0 > least_binding_op_idx)
-    {
-        if (kKW_OpenParenthesis == expression[0u])
-        {
-            expression.EatFirstSymbol();
-            expression.EatLastSymbol();
-            return ParseSideEffectExpression(expression);
-        }
-
-        bool function_was_called;
-        AccessData(VAC::kWriting, expression, vloc, scope_type, vartype, function_was_called);
-        if (function_was_called)
-            return ParseExpression_CheckUsedUp(expression);
-    }
+        ParseExpression_NoOps(expression, xres, result_used);
     else if (0 == least_binding_op_idx)
-    {
-        if (kKW_Decrement == op_sym || kKW_Increment == op_sym)
-            return ParseExpression_Term(expression, vloc, scope_type, vartype);
-    }
+        ParseExpression_Prefix(expression, xres);
     else if (expression.Length() - 1u == least_binding_op_idx)
-    {
-        if (kKW_Decrement == op_sym || kKW_Increment == op_sym)
-        {
-            // The prefix versions of those are more efficient
-            SrcList param = SrcList(expression, 0, expression.Length() - 1);
-            ParseExpression_PrefixModifier(op_sym, param, vloc, scope_type, vartype);
-            ParseExpression_CheckUsedUp(param);
-            expression.SetCursor(expression.Length()); // Eat the operator
-            return;
-        }
-    }
-    else if (0 > least_binding_op_idx)
-    {
-        if (kKW_OpenParenthesis == expression[0u])
-        {
-            expression.EatFirstSymbol();
-            expression.EatLastSymbol();
-            return ParseSideEffectExpression(expression);
-        }
-
-        bool function_was_called;
-        AccessData(VAC::kWriting, expression, vloc, scope_type, vartype, function_was_called);
-        if (function_was_called)
-            return ParseExpression_CheckUsedUp(expression);
-    }
-
-    UserError("Unexpected expression (Is this an incomplete assignment or function call?)");
-}
-
-void AGS::Parser::ParseExpression_Term(SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
-{
-    if (expression.Length() == 0)
-        InternalError("Cannot parse empty subexpression");
-
-    int const least_binding_op_idx = IndexOfLeastBondingOperator(expression); // can be < 0
-    
-    if (0 > least_binding_op_idx)
-        ParseExpression_NoOps(expression, vloc, scope_type, vartype);
-    else if (0 == least_binding_op_idx)
-        ParseExpression_Prefix(expression, vloc, scope_type, vartype);
-    else if (expression.Length() - 1u == least_binding_op_idx)
-        ParseExpression_Postfix(expression, vloc, scope_type, vartype);
+        ParseExpression_Postfix(expression, xres, result_used);
     else if (kKW_Tern == expression[least_binding_op_idx])
-        ParseExpression_Ternary(least_binding_op_idx, expression, vloc, scope_type, vartype);
+        ParseExpression_Ternary(least_binding_op_idx, expression, xres, result_used);
     else
-        ParseExpression_Binary(least_binding_op_idx, expression, vloc, scope_type, vartype);        
+        ParseExpression_Binary(least_binding_op_idx, expression, xres);        
     
-    return HandleStructOrArrayResult(vartype, vloc);
+    return HandleStructOrArrayResult(xres);
 }
 
 // We access a component of a struct in order to read or write it.
-void AGS::Parser::AccessData_StructMember(Symbol component, VariableAccess access_type, bool access_via_this, SrcList &expression,Parser::MemoryLocation &mloc, Vartype &vartype)
+void AGS::Parser::AccessData_StructMember(Symbol component, VariableAccess access_type, bool access_via_this, SrcList &expression, ExpressionResult &xres)
 {
     expression.GetNext(); // Eat component
     SymbolTableEntry &entry = _sym[component];
@@ -3110,12 +3100,18 @@ void AGS::Parser::AccessData_StructMember(Symbol component, VariableAccess acces
             "Protected component '%s' must not be accessed from outside",
             _sym.GetName(component).c_str());
 
-    mloc.AddComponentOffset(entry.ComponentD->Offset);
-    vartype = _sym.GetVartype(component);
+    _marMgr.AddComponentOffset(entry.ComponentD->Offset);
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = xres.kLOC_MARPointsToValue;
+    xres.Vartype = _sym.GetVartype(component);
+    xres.Modifiable =
+        xres.Modifiable &&
+        !compo_tqs[TQ::kReadonly] &&
+        (access_via_this || (!compo_tqs[TQ::kWriteprotected] && !compo_tqs[TQ::kProtected]));
+
 }
 
-// Get the symbol for the get or set function corresponding to the attribute given.
-void AGS::Parser::ConstructAttributeFuncName(Symbol attribsym, bool is_setter, bool is_indexed,Symbol &func)
+Symbol  AGS::Parser::ConstructAttributeFuncName(Symbol attribsym, bool is_setter, bool is_indexed)
 {
     std::string member_str = _sym.GetName(attribsym);
     // If "::" in the name, take the part after the last "::"
@@ -3125,7 +3121,7 @@ void AGS::Parser::ConstructAttributeFuncName(Symbol attribsym, bool is_setter, b
     char const *stem_str = is_setter ? "set" : "get";
     char const *indx_str = is_indexed ? "i_" : "_";
     std::string func_str = stem_str + (indx_str + member_str);
-    func = _sym.FindOrAdd(func_str);
+    return _sym.FindOrAdd(func_str);
 }
 
 // We call the getter or setter of an attribute
@@ -3188,11 +3184,11 @@ void AGS::Parser::AccessData_CallAttributeFunc(bool is_setter, SrcList &expressi
         // The index to be set is in the [...] clause; push it as the first parameter
         if (attrib_uses_this)
             PushReg(SREG_MAR); // must not be clobbered
-        ValueLocation vloc;
+        ExpressionResult xres;
         Expect(kKW_OpenBracket, _src.GetNext());
-        ParseIntegerExpression(expression, vloc);
+        ParseIntegerExpression(expression, xres);
         Expect(kKW_CloseBracket, _src.GetNext());
-        ResultToAX(kKW_Int, vloc);
+        ExpressionResultToAx(xres);
 
         if (attrib_uses_this)
             PopReg(SREG_MAR);
@@ -3217,19 +3213,19 @@ void AGS::Parser::AccessData_CallAttributeFunc(bool is_setter, SrcList &expressi
 
 
 // Location contains a pointer to another address. Get that address.
-void AGS::Parser::AccessData_Dereference(ValueLocation &vloc,Parser::MemoryLocation &mloc)
+void AGS::Parser::AccessData_Dereference(ExpressionResult &xres)
 {
-    if (ValueLocation::kAX_is_value == vloc.location)
+    if (ExpressionResult::kLOC_AX == xres.Location)
     {
         WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_MAR);
         _reg_track.SetRegister(SREG_MAR);
         WriteCmd(SCMD_CHECKNULL);
-        vloc.location = ValueLocation::kMAR_pointsto_value;
-        mloc.Reset();
+        xres.Location = ExpressionResult::kLOC_MARPointsToValue;
+        _marMgr.Reset();
     }
     else
     {
-        mloc.MakeMARCurrent(_src.GetLineno(), _scrip);
+        _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
         // We need to check here whether m[MAR] == 0, but CHECKNULL
         // checks whether MAR == 0. So we need to do MAR := m[MAR] first.
         WriteCmd(SCMD_MEMREADPTR, SREG_MAR);
@@ -3238,62 +3234,61 @@ void AGS::Parser::AccessData_Dereference(ValueLocation &vloc,Parser::MemoryLocat
     }
 }
 
-void AGS::Parser::AccessData_ProcessArrayIndexConstant(size_t idx, Symbol const lit, size_t num_array_elements, size_t element_size, MemoryLocation &mloc)
+void AGS::Parser::AccessData_ProcessCurrentArrayIndex(size_t const idx, size_t const dim, size_t const factor, bool const is_dynarray, SrcList &expression)
 {
-    
-    CodeCell const array_index = _sym[lit].LiteralD->Value;
-    if (array_index < 0)
-        UserError(
-            "Array index #%u is %d, thus too low (minimum is 0)",
-            idx + 1u,
-            array_index);
-    if (num_array_elements > 0 && static_cast<size_t>(array_index) >= num_array_elements)
-        UserError(
-            "Array index #%u is %d, thus too high (maximum is %u)",
-            idx + 1u,
-            array_index,
-            num_array_elements - 1u);
-
-    mloc.AddComponentOffset(array_index * element_size);
-}
-
-void AGS::Parser::AccessData_ProcessCurrentArrayIndex(size_t idx, size_t dim, size_t factor, bool is_dynarray, SrcList &expression, MemoryLocation &mloc)
-{
-    // For giving details in error messages
-    std::string msg = "In array index #<idx>: ";
-    msg.replace(msg.find("<idx>"), 5u, std::to_string(idx));
-
     // Get the index
     size_t const index_start = expression.GetCursor();
     SkipTo(SymbolList{ kKW_Comma, kKW_CloseBracket }, expression);
     size_t const index_end = expression.GetCursor();
     SrcList current_index = SrcList(expression, index_start, index_end - index_start);
     if (0 == current_index.Length())
-        UserError("Empty array index is not supported here");
+        UserError("Array index #u is empty, this is not supported here", idx + 1u);
 
-    // Parse the index on the off-chance that it can be completely calculated at compile time.
-    RestorePoint start_of_index(_scrip);
-    ValueLocation vloc;
-    current_index.StartRead();
-    ParseIntegerExpression(current_index, vloc, msg);
-    if (vloc.IsCompileTimeLiteral())
-        return AccessData_ProcessArrayIndexConstant(idx, vloc.symbol, dim, factor, mloc);
+    ExpressionResult xres;
+    // If all ops are pending on the MAR register, it hasn't been set yet at all.
+    // So then we don't need to protect MAR against being clobbered, 
+    // but we do need to keep track of those pending ops in this case.
+    bool const all_ops_pending = _marMgr.AllOpsPending();
+    MarMgr save_mar_state(_marMgr);
+    RegisterGuard(all_ops_pending ? RegisterList{} : RegisterList{ SREG_MAR },
+        [&]
+        {
+            std::string msg = "In array index #<idx>: ";
+            msg.replace(msg.find("<idx>"), 5u, std::to_string(idx + 1u));
+            current_index.StartRead();
+            ParseIntegerExpression(current_index, xres, msg);
+            if (xres.kTY_Literal != xres.Type)
+                ExpressionResultToAx(xres);
+        });
 
-    // So it cannot. We have to redo this in order to save MAR out of the way first.
-    start_of_index.Restore();
-    mloc.MakeMARCurrent(_src.GetLineno(), _scrip);
-    _reg_track.SetRegister(SREG_MAR);
-    PushReg(SREG_MAR);
-    current_index.StartRead();
-    ParseIntegerExpression(current_index, vloc, msg);
-    ResultToAX(kKW_Int, vloc);
-    PopReg(SREG_MAR);
-    
-    // Note: DYNAMICBOUNDS compares the offset into the memory block;
+    if (xres.kTY_Literal == xres.Type)
+    {
+        // The arrax index is known at compile time, so check it
+        int const index_value = _sym[xres.Symbol].LiteralD->Value;
+        if (index_value < 0)
+            UserError(
+                "Array index #%u is %d, thus too low (minimum is 0)",
+                idx + 1u,
+                index_value);
+        if (dim > 0 && static_cast<size_t>(index_value) >= dim)
+            UserError(
+                "Array index #%u is %d, thus too high (maximum is %u)",
+                idx + 1u,
+                index_value,
+                dim - 1u);
+        
+        _marMgr.AddComponentOffset(index_value * factor);
+        return;
+    }
+
+    if (all_ops_pending)
+        _marMgr = save_mar_state;
+
+    // DYNAMICBOUNDS compares the offset into the memory block:
     // it mustn't be larger than the size of the allocated memory. 
-    // On the other hand, CHECKBOUNDS checks the index; it mustn't be
+    // On the other hand, CHECKBOUNDS checks the index: it mustn't be
     // larger than the maximum given. So dynamic bounds must be checked
-    // after the multiplication; static bounds before the multiplication.
+    // _after_ the multiplication; static bounds _before_ the multiplication.
     // For better error messages at runtime, don't do CHECKBOUNDS after the multiplication.
     if (!is_dynarray)
         WriteCmd(SCMD_CHECKBOUNDS, SREG_AX, dim);
@@ -3304,32 +3299,34 @@ void AGS::Parser::AccessData_ProcessCurrentArrayIndex(size_t idx, size_t dim, si
     }
     if (is_dynarray)
         WriteCmd(SCMD_DYNAMICBOUNDS, SREG_AX);
+
+    _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
     WriteCmd(SCMD_ADDREG, SREG_MAR, SREG_AX);
     _reg_track.SetRegister(SREG_MAR);
 }
 
 // We're processing some struct component or global or local variable.
 // If an array index follows, parse it and shorten symlist accordingly
-void AGS::Parser::AccessData_ProcessAnyArrayIndex(ValueLocation vloc_of_array, SrcList &expression, ValueLocation &vloc,Parser::MemoryLocation &mloc, Vartype &vartype)
+void AGS::Parser::AccessData_ProcessArrayIndexIfThere(SrcList &expression, ExpressionResult &xres)
 {
     if (kKW_OpenBracket != expression.PeekNext())
         return;
     expression.GetNext(); // Eat '['
 
-    bool const is_dynarray = _sym.IsDynarrayVartype(vartype);
-    bool const is_array = _sym.IsArrayVartype(vartype);
+    bool const is_dynarray = _sym.IsDynarrayVartype(xres.Vartype);
+    bool const is_array = _sym.IsArrayVartype(xres.Vartype);
     if (!is_dynarray && !is_array)
         UserError("Array index is only legal after an array expression");
 
-    Vartype const element_vartype = _sym[vartype].VartypeD->BaseVartype;
+    Vartype const element_vartype = _sym[xres.Vartype].VartypeD->BaseVartype;
     size_t const element_size = _sym.GetSize(element_vartype);
     std::vector<size_t> dim_sizes;
     std::vector<size_t> dynarray_dims = { 0, };
-    std::vector<size_t> &dims = is_dynarray ? dynarray_dims : _sym[vartype].VartypeD->Dims;
-    vartype = element_vartype;
+    std::vector<size_t> &dims = is_dynarray ? dynarray_dims : _sym[xres.Vartype].VartypeD->Dims;
+    xres.Vartype = element_vartype;
 
     if (is_dynarray)
-        AccessData_Dereference(vloc, mloc);
+        AccessData_Dereference(xres);
 
     // Number of dimensions and the the size of the dimension for each dimension
     size_t const num_of_dims = dims.size();
@@ -3343,7 +3340,7 @@ void AGS::Parser::AccessData_ProcessAnyArrayIndex(ValueLocation vloc_of_array, S
 
     for (size_t dim_idx = 0; dim_idx < num_of_dims; dim_idx++)
     {
-        AccessData_ProcessCurrentArrayIndex(dim_idx, dims[dim_idx], dim_sizes[dim_idx], is_dynarray, expression, mloc);
+        AccessData_ProcessCurrentArrayIndex(dim_idx, dims[dim_idx], dim_sizes[dim_idx], is_dynarray, expression);
         
         Symbol divider = expression.PeekNext();
         Expect(SymbolList{ kKW_CloseBracket, kKW_Comma }, divider);
@@ -3365,198 +3362,242 @@ void AGS::Parser::AccessData_ProcessAnyArrayIndex(ValueLocation vloc_of_array, S
     }
 }
 
-void AGS::Parser::AccessData_Variable(ScopeType scope_type, VariableAccess access_type, SrcList &expression,Parser::MemoryLocation &mloc, Vartype &vartype)
+void AGS::Parser::AccessData_Variable(VariableAccess access_type, SrcList &expression, ExpressionResult &xres)
 {
     Symbol varname = expression.GetNext();
-    if (ScT::kImport == scope_type)
-        MarkAcessed(varname);
     SymbolTableEntry &entry = _sym[varname];
     CodeCell const soffs = entry.VariableD->Offset;
     auto const var_tqs = entry.VariableD->TypeQualifiers;
+    auto const scope_type = _sym.GetScopeType(varname);
+
+    if (var_tqs[TQ::kImport])
+        MarkAcessed(varname);
 
     if (VAC::kReading != access_type && var_tqs[TQ::kReadonly])
-        UserError("Cannot write to readonly '%s'", _sym.GetName(varname).c_str());
+        UserError("Cannot modify the readonly '%s'", _sym.GetName(varname).c_str());
 
-    mloc.SetStart(scope_type, soffs);
-    vartype = _sym.GetVartype(varname);
+    _marMgr.Reset();
+    _marMgr.SetStart(scope_type, soffs);
+    _reg_track.SetRegister(SREG_MAR);
 
-    // Process an array index if it follows
-    ValueLocation vl_dummy = { ValueLocation::kMAR_pointsto_value, kKW_NoSymbol };
-    ValueLocation const vl_of_array = { ValueLocation::kMAR_pointsto_value, kKW_NoSymbol };
-    return AccessData_ProcessAnyArrayIndex(vl_of_array, expression, vl_dummy, mloc, vartype);
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = xres.kLOC_MARPointsToValue;
+    xres.Symbol = kKW_NoSymbol;
+    xres.Vartype = _sym.GetVartype(varname);
+    xres.LocalNonParameter = (ScT::kLocal == scope_type && entry.Scope != _sym.kParameterScope);
+    xres.Modifiable = !var_tqs[TQ::kReadonly];
+    return AccessData_ProcessArrayIndexIfThere(expression, xres);
+
 }
 
-void AGS::Parser::AccessData_FirstClause(VariableAccess access_type, SrcList &expression, ValueLocation &vloc, ScopeType &return_scope_type, Parser::MemoryLocation &mloc, Vartype &vartype, bool &implied_this_dot, bool &static_access, bool &func_was_called)
+void AGS::Parser::AccessData_This(ExpressionResult &xres)
+{
+    // The expression returned is "this"
+    xres.Type = xres.kTY_RunTimeValue;
+    xres.Location = xres.kLOC_MARPointsToValue;
+    xres.Symbol = kKW_NoSymbol;
+    xres.Vartype = _sym.GetVartype(kKW_This);
+    xres.Modifiable = true;
+
+    WriteCmd(SCMD_REGTOREG, SREG_OP, SREG_MAR);
+    _reg_track.SetRegister(SREG_MAR);
+    WriteCmd(SCMD_CHECKNULL);
+    _marMgr.Reset();
+}
+
+void AGS::Parser::AccessData_FirstClause(VariableAccess access_type, SrcList &expression, ExpressionResult &xres, bool &implied_this_dot)
 {
     implied_this_dot = false;
 
+    // Set defaults that are almost always correct
+    xres.SideEffects = false;
+
     Symbol const first_sym = expression.PeekNext();
 
-    do // exactly one time
+    if (kKW_Null == first_sym ||
+        _sym.IsConstant(first_sym) ||
+        _sym.IsLiteral(first_sym))
     {
-        if (kKW_This == first_sym)
+        if (VAC::kReading != access_type)
+            UserError("Cannot modify '%s'", _sym.GetName(first_sym).c_str());
+
+        expression.GetNext();
+        Symbol lit = first_sym;
+        expression.GetNext(); // eat the literal
+        while (_sym.IsConstant(lit))
+            lit = _sym[lit].ConstantD->ValueSym;
+        SetCompileTimeLiteral(lit, xres);
+        return;
+    }
+
+    if (_sym.IsFunction(first_sym))
+    {
+        expression.GetNext(); // Eat function symbol
+        if (kKW_OpenParenthesis != expression.PeekNext())
         {
-            expression.GetNext(); // Eat 'this'
-            vartype = _sym.GetVartype(kKW_This);
-            if (kKW_NoSymbol == vartype)
-                UserError("'this' is only legal in non-static struct functions");
-
-            vloc.location = ValueLocation::kMAR_pointsto_value;
-            WriteCmd(SCMD_REGTOREG, SREG_OP, SREG_MAR);
-            _reg_track.SetRegister(SREG_MAR);
-            WriteCmd(SCMD_CHECKNULL);
-            mloc.Reset();
-            if (kKW_Dot == expression.PeekNext())
-            {
-                expression.GetNext(); // Eat '.'
-                // Going forward, we must "imply" "this." since we've just gobbled it.
-                implied_this_dot = true;
-            }
-
+            // Return the function symbol as-is
+            xres.Type = xres.kTY_FunctionName;
+            xres.Location = xres.kLOC_Symbol;
+            xres.Symbol = first_sym;
+            xres.Vartype = kKW_NoSymbol;
+            xres.Modifiable = false;
             return;
         }
 
-        if (kKW_Null == first_sym ||
-            _sym.IsConstant(first_sym) ||
-            _sym.IsLiteral(first_sym))
-        {
-            if (VAC::kReading != access_type) break; // to error msg
+        AccessData_FunctionCall(first_sym, expression, xres);
+        if (_sym.IsDynarrayVartype(xres.Vartype))
+            AccessData_ProcessArrayIndexIfThere(expression, xres);
+        return;
+    }
 
-            expression.GetNext();
-            Symbol lit = first_sym;
-            expression.GetNext(); // eat the literal
-            while (_sym.IsConstant(lit))
-                lit = _sym[lit].ConstantD->ValueSym;
-            return_scope_type = ScT::kGlobal;
-            return SetCompileTimeLiteral(lit, vloc, vartype);
-        }
+    if (kKW_This == first_sym)
+    {
+        if (kKW_NoSymbol == _sym.GetVartype(kKW_This))
+            UserError("'this' is only legal in a non-static struct function");
 
-        if (_sym.IsFunction(first_sym))
-        {
-            func_was_called = true;
-            return_scope_type = ScT::kGlobal;
-            vloc.location = ValueLocation::kAX_is_value;
-            AccessData_FunctionCall(first_sym, expression, mloc, vartype);
-            if (_sym.IsDynarrayVartype(vartype))
-                return AccessData_ProcessAnyArrayIndex(vloc, expression, vloc, mloc, vartype);
-            return;
-        }
+        expression.GetNext(); // Eat 'this'
 
-        if (_sym.IsVariable(first_sym))
-        {
-            ScopeType const scope_type = _sym.GetScopeType(first_sym);
-            // Parameters may be 'return'ed even though they are local because they are allocated
-            // outside of the function proper. Therefore return scope type for them is global.
-            return_scope_type = _sym.IsParameter(first_sym) ? ScT::kGlobal : scope_type;
-            vloc.location = ValueLocation::kMAR_pointsto_value;
-            return AccessData_Variable(scope_type, access_type, expression, mloc, vartype);
-        }
+        AccessData_This(xres);
 
-        if (_sym.IsVartype(first_sym))
+        if (kKW_Dot == expression.PeekNext())
         {
-            return_scope_type = ScT::kGlobal;
-            static_access = true;
-            vartype = expression.GetNext();
-            mloc.Reset();
-            return;
-        }
-    
-        // If this unknown symbol can be interpreted as a component of 'this',
-        // treat it that way.
-        vartype = _sym.GetVartype(kKW_This);
-        if (_sym.IsVartype(vartype) && _sym[vartype].VartypeD->Components.count(first_sym))
-        {
-            vloc.location = ValueLocation::kMAR_pointsto_value;
-            WriteCmd(SCMD_REGTOREG, SREG_OP, SREG_MAR);
-            _reg_track.SetRegister(SREG_MAR);
-            WriteCmd(SCMD_CHECKNULL);
-            mloc.Reset();
-
-            // Going forward, the code should imply "this."
-            // with the '.' already read in.
+            expression.GetNext(); // Eat '.'
+            // Going forward, we must "imply" "this." since we've just gobbled it.
             implied_this_dot = true;
-            // Then the component needs to be read again.
-            expression.BackUp();
-            return;
         }
+        return;
+    }
 
-        UserError("Unexpected '%s'", _sym.GetName(first_sym).c_str());
-    } while (false);
+    if (_sym.IsVariable(first_sym))
+    {
+        AccessData_Variable(access_type, expression, xres);
+        return;
+    }
 
-    UserError("Cannot assign a value to '%s'", _sym.GetName(expression[0]).c_str());
+    if (_sym.IsStructVartype(first_sym))
+    {
+        expression.GetNext(); // Eat the struct vartype
+        // Return the struct itself, static access
+        xres.Type = xres.kTY_StructName;
+        xres.Location = xres.kLOC_Symbol;
+        xres.Symbol = first_sym;
+        xres.Vartype = kKW_NoSymbol;
+        _marMgr.Reset();
+        return;
+    }
+
+    // Can this unknown symbol be interpreted as a component of 'this'?
+    Vartype const this_vartype = _sym.GetVartype(kKW_This);
+    if (_sym.IsVartype(this_vartype) && _sym[this_vartype].VartypeD->Components.count(first_sym))
+    {
+        // Fake a "this." here
+        AccessData_This(xres);
+
+        // Going forward, the code should imply "this."
+        // with the '.' already read in.
+        implied_this_dot = true;
+        // Then the component needs to be read again.
+        expression.BackUp();
+        return;
+    }
+
+    UserError("Unexpected '%s' in expression", _sym.GetName(first_sym).c_str());
 }
 
 // We're processing a STRUCT.STRUCT. ... clause.
 // We've already processed some structs, and the type of the last one is vartype.
 // Now we process a component of vartype.
-void AGS::Parser::AccessData_SubsequentClause(VariableAccess access_type, bool access_via_this, bool static_access, SrcList &expression, ValueLocation &vloc, ScopeType &return_scope_type, MemoryLocation &mloc, Vartype &vartype, bool &func_was_called)
+void AGS::Parser::AccessData_SubsequentClause(VariableAccess access_type, bool access_via_this, SrcList &expression, ExpressionResult &xres)
 {
+    bool const static_access = (xres.kTY_StructName == xres.Type);
+    Vartype const vartype = static_access ? xres.Symbol : xres.Vartype;
     Symbol const unqualified_component = expression.PeekNext();
     Symbol const qualified_component = FindComponentInStruct(vartype, unqualified_component);
 
+    // Note: Don't unconditionally reset 'xres.LocalNonParameter', 'xres.SideEffects'
+    // if they are true, the true should stick
+
     if (kKW_NoSymbol == qualified_component)
         UserError(
-            "Expected a component of '%s', found '%s' instead",
+            ReferenceMsgSym("Expected a component of '%s', found '%s' instead", vartype).c_str(),
             _sym.GetName(vartype).c_str(),
             _sym.GetName(unqualified_component).c_str());
 
-
     if (_sym.IsAttribute(qualified_component))
     {
-        func_was_called = true;
         // make MAR point to the struct of the attribute
-        mloc.MakeMARCurrent(_src.GetLineno(), _scrip);
+        _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
         _reg_track.SetRegister(SREG_MAR);
 
         if (VAC::kWriting == access_type)
         {
-            // We cannot process the attribute here so return to the assignment that
-            // this attribute was originally called from
-            vartype = _sym[qualified_component].AttributeD->Vartype;
-            vloc.location = ValueLocation::kAttribute;
-            vloc.symbol = qualified_component;
+            // We cannot process the attribute here so return the attribute itself
+            xres.Type = xres.kTY_AttributeName;
+            xres.Location = xres.kLOC_Symbol;
+            xres.Symbol = qualified_component;
+            xres.Vartype = _sym[qualified_component].AttributeD->Vartype;
+            if (kKW_NoSymbol == _sym[qualified_component].AttributeD->Setter)
+                UserError(
+                    ReferenceMsgSym("Attribute '%s' is readonly", qualified_component).c_str(),
+                    _sym.GetName(unqualified_component).c_str());
             return;
         }
-        vloc.location = ValueLocation::kAX_is_value;
         bool const is_setter = false;
-        return_scope_type = ScT::kLocal;
         AccessData_CallAttributeFunc(is_setter, expression, vartype);
-        vartype = _sym[qualified_component].AttributeD->Vartype;
+        xres.Type = xres.kTY_RunTimeValue;
+        xres.Location = xres.kLOC_AX;
+        xres.Symbol = kKW_NoSymbol;
+        xres.Vartype = _sym[qualified_component].AttributeD->Vartype;
+        xres.SideEffects = true; // Calling an attribute is a side-effect
         return;
     }
 
     if (_sym.IsConstant(qualified_component))
     {
         expression.GetNext(); // Eat the constant symbol
-        vloc.location = ValueLocation::kCompile_time_literal;
-        vloc.symbol = _sym[qualified_component].ConstantD->ValueSym;
-        vartype = _sym[vloc.symbol].LiteralD->Vartype;
+
+        xres.Type = xres.kTY_Literal;
+        xres.Location = xres.kLOC_Symbol;
+        xres.Symbol = _sym[qualified_component].ConstantD->ValueSym;
+        xres.Vartype = _sym[xres.Symbol].LiteralD->Vartype;
+        xres.Modifiable = false;
         return;
     }
 
     if (_sym.IsFunction(qualified_component))
     {
-        func_was_called = true;
         if (static_access && !_sym[qualified_component].FunctionD->TypeQualifiers[TQ::kStatic])
             UserError("Must specify a specific object for non-static function %s", _sym.GetName(qualified_component).c_str());
 
-        vloc.location = ValueLocation::kAX_is_value;
-        return_scope_type = ScT::kLocal;
+        expression.GetNext(); // Eat function symbol
+        if (kKW_OpenParenthesis != expression.PeekNext())
+        {
+            // Return the function symbol as-is
+            xres.Type = xres.kTY_FunctionName;
+            xres.Location = xres.kLOC_Symbol;
+            xres.Symbol = qualified_component;
+            xres.Vartype = kKW_NoSymbol;
+            xres.Modifiable = false;
+            return;
+        }
+
+        expression.BackUp();
         SrcList start_of_funccall = SrcList(expression, expression.GetCursor(), expression.Length());
-        AccessData_FunctionCall(qualified_component, start_of_funccall, mloc, vartype);
+        AccessData_FunctionCall(qualified_component, start_of_funccall, xres);
         if (_sym.IsDynarrayVartype(vartype))
-            return AccessData_ProcessAnyArrayIndex(vloc, expression, vloc, mloc, vartype);
+            return AccessData_ProcessArrayIndexIfThere(expression, xres);
         return;
     }
 
     if (_sym.IsVariable(qualified_component))
     {
         if (static_access && !_sym[qualified_component].VariableD->TypeQualifiers[TQ::kStatic])
-            UserError("Must specify a specific object for non-static component %s", _sym.GetName(qualified_component).c_str());
+            UserError(
+                ReferenceMsgSym("Must specify a specific object for non-static component %s", qualified_component).c_str(),
+                _sym.GetName(qualified_component).c_str());
 
-        vloc.location = ValueLocation::kMAR_pointsto_value;
-        AccessData_StructMember(qualified_component, access_type, access_via_this, expression, mloc, vartype);
-        return AccessData_ProcessAnyArrayIndex(vloc, expression, vloc, mloc, vartype);
+        AccessData_StructMember(qualified_component, access_type, access_via_this, expression, xres);
+        return AccessData_ProcessArrayIndexIfThere(expression, xres);
     }
 
     InternalError("Unknown kind of component of '%s'", _sym.GetName(vartype).c_str());
@@ -3588,43 +3629,31 @@ AGS::Symbol AGS::Parser::FindComponentInStruct(Vartype strct, Symbol unqualified
 
 // We are in a STRUCT.STRUCT.STRUCT... cascade.
 // Check whether we have passed the last dot
-void AGS::Parser::AccessData_IsClauseLast(SrcList &expression, bool &is_last)
+bool AGS::Parser::AccessData_IsClauseLast(SrcList &expression)
 {
     size_t const cursor = expression.GetCursor();
     SkipTo(kKW_Dot,  expression);
-    is_last = (kKW_Dot != expression.PeekNext());
+    bool is_last = (kKW_Dot != expression.PeekNext());
     expression.SetCursor(cursor);
+    return is_last;
 }
 
 // Access a variable, constant, literal, func call, struct.component.component cascade, etc.
-// Result is in AX or m[MAR], dependent on vloc. Type is in vartype.
 // At end of function, symlist and symlist_len will point to the part of the symbol string
 // that has not been processed yet
-// NOTE: If this selects an attribute for writing, then the corresponding function will
-// _not_ be called and symlist[0] will be the attribute.
-void AGS::Parser::AccessData(VariableAccess access_type, SrcList &expression, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype, bool &func_was_called)
+void AGS::Parser::AccessData(VariableAccess access_type, SrcList &expression, ExpressionResult &xres)
 {
     expression.StartRead();
     if (0 == expression.Length())
         InternalError("Empty expression");
-
-    func_was_called = false;
-
-    // For memory accesses, we set the MAR register lazily so that we can
-    // accumulate offsets at runtime instead of compile time.
-    // This object tracks what we will need to do to set the MAR register.
-    MemoryLocation mloc = MemoryLocation(*this);
-
-    bool clause_is_last = false;
-    AccessData_IsClauseLast(expression, clause_is_last);
-    
+   
     bool implied_this_dot = false; // only true when "this." is implied
     bool static_access = false; // only true when a vartype has just been parsed
 
     // If we are reading, then all the accesses are for reading.
     // If we are writing, then all the accesses except for the last one
     // are for reading and the last one will be for writing.
-    AccessData_FirstClause(clause_is_last? access_type : VAC::kReading, expression, vloc, scope_type, mloc, vartype, implied_this_dot, static_access, func_was_called);
+    AccessData_FirstClause(AccessData_IsClauseLast(expression) ? access_type : VAC::kReading, expression, xres, implied_this_dot);
     
     Vartype outer_vartype = kKW_NoSymbol;
 
@@ -3636,58 +3665,48 @@ void AGS::Parser::AccessData(VariableAccess access_type, SrcList &expression, Va
             expression.GetNext(); // Eat '.'
         // Note: do not reset "implied_this_dot" here, it's still needed.
 
-        // Here, if ValueLocation::kMAR_pointsto_value == vloc.location then the first byte of outer is at m[MAR + mar_offset].
-        // We accumulate mar_offset at compile time as long as possible to save computing.
-        outer_vartype = vartype;
-
-        if (_sym.IsDynpointerVartype(vartype))
+        // Here, if ExpressionResult::kLOC_MARPointsToValue == xres.location then the first byte of outer is at m[MAR + mar_offset].
+        outer_vartype = xres.kTY_StructName == xres.Type? xres.Symbol : xres.Vartype;
+        if (xres.kTY_StructName == xres.Type)
         {
-            AccessData_Dereference(vloc, mloc);
-            vartype = _sym.VartypeWithout(VTT::kDynpointer, vartype);
+            outer_vartype = xres.Symbol; // Static access
         }
-
-        if (_sym.IsDynarrayVartype(vartype) && _sym.FindOrAdd("Length") == expression.PeekNext())
+        else
         {
-            // Pseudo attribute 'Length' will get the length of the dynarray
-            expression.GetNext(); // eat 'Length'
+            if (_sym.IsDynpointerVartype(xres.Vartype))
+            {
+                AccessData_Dereference(xres);
+                xres.Vartype = _sym.VartypeWithout(VTT::kDynpointer, xres.Vartype);
+            }
 
-            AccessData_GenerateDynarrayLengthFuncCall(mloc, vloc, scope_type, vartype);
-            implied_this_dot = false;
-            continue;
-        }
+            if (_sym.IsDynarrayVartype(xres.Vartype) && _sym.FindOrAdd("Length") == expression.PeekNext())
+            {
+                // Pseudo attribute 'Length' will get the length of the dynarray
+                expression.GetNext(); // eat 'Length'
 
-        if (!_sym.IsStructVartype(vartype) || !_sym.IsAtomicVartype(vartype))
-        {
-            if (_sym.IsArrayVartype(vartype) || _sym.IsDynarrayVartype(vartype))
+                AccessData_GenerateDynarrayLengthFuncCall(xres);
+                implied_this_dot = false;
+                continue;
+            }
+
+            if (_sym.IsArrayVartype(xres.Vartype) || _sym.IsDynarrayVartype(xres.Vartype))
                 UserError("Expected a struct in front of '.' but found an array instead");
-            else        
+            else if (!_sym.IsStructVartype(xres.Vartype))
                 UserError(
                     "Expected a struct in front of '.' but found an expression of type '%s' instead",
                     _sym.GetName(outer_vartype).c_str());
         }
-
         if (expression.ReachedEOF())
             UserError("Expected struct component after '.' but did not find it");
 
-        AccessData_IsClauseLast(expression, clause_is_last);
-        
         // If we are reading, then all the accesses are for reading.
         // If we are writing, then all the accesses except for the last one
         // are for reading and the last one will be for writing.
-        AccessData_SubsequentClause(clause_is_last ? access_type : VAC::kReading, implied_this_dot, static_access, expression, vloc, scope_type, mloc, vartype, func_was_called);
+        AccessData_SubsequentClause(AccessData_IsClauseLast(expression) ? access_type : VAC::kReading, implied_this_dot, expression, xres);
         
-        // Next component access, if there is any, is dependent on
-        // the current access, no longer on "this".
+        // Next component access, if there is any, is dependent on the current access, no longer on "this".
         implied_this_dot = false;
-        // Next component access, if there is any, won't be static.
-        static_access = false;
     }
-
-    if (ValueLocation::kAX_is_value == vloc.location || ValueLocation::kCompile_time_literal == vloc.location)
-		return;
-
-    _reg_track.SetRegister(SREG_MAR);
-    return mloc.MakeMARCurrent(_src.GetLineno(), _scrip);
 }
 
 // Insert Bytecode for:
@@ -3725,52 +3744,59 @@ void AGS::Parser::AccessData_StrCpy()
 // evaluated, and the result of that evaluation is in AX.
 // Store AX into the memory location that corresponds to LHS, or
 // call the attribute function corresponding to LHS.
-void AGS::Parser::AccessData_AssignTo(ScopeType sct, Vartype vartype, SrcList &expression)
+void AGS::Parser::AccessData_AssignTo(SrcList &expression, ExpressionResult xres)
 {
     // We'll evaluate expression later on which moves the cursor,
     // so save it here and restore later on
     size_t const end_of_rhs_cursor = _src.GetCursor();
 
-    Vartype rhsvartype = vartype;
-    ScopeType rhs_scope_type = sct;
-    ValueLocation vloc;
-    Vartype lhsvartype;
-    ScopeType lhs_scope_type;
+    ExpressionResult rhs_xres = xres;
+    if (ExpressionResult::kTY_Literal != rhs_xres.Type)
+        ExpressionResultToAx(rhs_xres);
 
-    // AX contains the result of evaluating the RHS of the assignment, so mustn't be clobbered
-    RegisterGuard(SREG_AX,
+
+    // Get the LHS of the assignment for writing.
+    // Protect the register from being clobbered that contains the result of the RHS.
+    ExpressionResult lhs_xres;
+    RegisterGuard(
+        ExpressionResult::kLOC_AX == rhs_xres.Location ? RegisterList{ SREG_AX } :
+        ExpressionResult::kLOC_MARPointsToValue == rhs_xres.Location ? RegisterList{ SREG_MAR } :
+        RegisterList{},
         [&]
         {
-            AccessData(VAC::kWriting, expression, vloc, lhs_scope_type, lhsvartype);
+            AccessData(VAC::kWriting, expression, lhs_xres);
+            if (!expression.ReachedEOF()  && lhs_xres.kTY_AttributeName != lhs_xres.Type)
+                // Spurious characters follow the LHS in front of the assignment symbol, e.g., 'var 77 = 9;'
+                UserError("Unexpected '%s'", _sym.GetName(expression.PeekNext()).c_str());
             
-            if (ValueLocation::kAX_is_value == vloc.location)
+            if (ExpressionResult::kLOC_AX == lhs_xres.Location)
             {
-                if (!_sym.IsManagedVartype(lhsvartype))
+                if (!_sym.IsManagedVartype(lhs_xres.Vartype))
                     UserError("Cannot modify this value");
 				
                 WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_MAR);
                 _reg_track.SetRegister(SREG_MAR);
                 WriteCmd(SCMD_CHECKNULL);
-                vloc.location = ValueLocation::kMAR_pointsto_value;
+                rhs_xres.Location = ExpressionResult::kLOC_MARPointsToValue;
             }
-            return;
         });
-    
-    if (ValueLocation::kAttribute == vloc.location)
+
+    ExpressionResultToAx(rhs_xres);
+
+    if (ExpressionResult::kTY_AttributeName == lhs_xres.Type) 
     {
-        ConvertAXStringToStringObject(lhsvartype, rhsvartype);
-
         // We need to call the attribute setter
-        Symbol const attribute = vloc.symbol;
+        Symbol const attribute = lhs_xres.Symbol;
 
-        if (IsVartypeMismatch_Oneway(rhsvartype, lhsvartype))
+        ConvertAXStringToStringObject(lhs_xres.Vartype, rhs_xres.Vartype);        
+        if (IsVartypeMismatch_Oneway(rhs_xres.Vartype, lhs_xres.Vartype))
             UserError(
                 ReferenceMsgSym(
                     "Attribute '%s' has type '%s'; cannot assign a type '%s' value to it",
                     attribute).c_str(),
                 _sym.GetName(attribute).c_str(),
-                _sym.GetName(lhsvartype).c_str(),
-                _sym.GetName(rhsvartype).c_str());
+                _sym.GetName(lhs_xres.Vartype).c_str(),
+                _sym.GetName(rhs_xres.Vartype).c_str());
 
         Vartype struct_of_attribute = _sym[attribute].ComponentD->Parent;
         bool const is_setter = true;
@@ -3779,9 +3805,10 @@ void AGS::Parser::AccessData_AssignTo(ScopeType sct, Vartype vartype, SrcList &e
         return;
     }
 
-    // MAR points to the value
+    // At this point, the result of the RHS must be moved to the place MAR points to
+    _marMgr.MakeMARCurrent(_src.GetLineno(), _scrip);
 
-    if (kKW_String == lhsvartype && kKW_String == _sym.VartypeWithout(VTT::kConst, rhsvartype))
+    if (kKW_String == lhs_xres.Vartype && kKW_String == _sym.VartypeWithout(VTT::kConst, rhs_xres.Vartype))
     {
         // copy the string contents over.
         AccessData_StrCpy();
@@ -3789,16 +3816,16 @@ void AGS::Parser::AccessData_AssignTo(ScopeType sct, Vartype vartype, SrcList &e
         return;
     }
 
-    ConvertAXStringToStringObject(lhsvartype, rhsvartype);
-    if (IsVartypeMismatch_Oneway(rhsvartype, lhsvartype))
+    ConvertAXStringToStringObject(lhs_xres.Vartype, rhs_xres.Vartype);
+    if (IsVartypeMismatch_Oneway(rhs_xres.Vartype, lhs_xres.Vartype))
         UserError(
             "Cannot assign a type '%s' value to a type '%s' variable",
-            _sym.GetName(rhsvartype).c_str(),
-            _sym.GetName(lhsvartype).c_str());
+            _sym.GetName(rhs_xres.Vartype).c_str(),
+            _sym.GetName(lhs_xres.Vartype).c_str());
 
     CodeCell const opcode =
-        _sym.IsDynVartype(lhsvartype) ?
-        SCMD_MEMWRITEPTR : GetWriteCommandForSize(_sym.GetSize(lhsvartype));
+        _sym.IsDynVartype(lhs_xres.Vartype) ?
+        SCMD_MEMWRITEPTR : GetWriteCommandForSize(_sym.GetSize(lhs_xres.Vartype));
     WriteCmd(opcode, SREG_AX);
     _reg_track.SetRegister(SREG_AX);
     _src.SetCursor(end_of_rhs_cursor); // move cursor back to end of RHS
@@ -3902,7 +3929,7 @@ void AGS::Parser::SkipToEndOfExpression()
         InternalError("Nesting corrupted");
 }
 
-void AGS::Parser::ParseExpression(SrcList &src, ValueLocation &vloc, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseExpression(SrcList &src, ExpressionResult &xres)
 {
     size_t const expr_start = _src.GetCursor();
     SkipToEndOfExpression();
@@ -3911,131 +3938,97 @@ void AGS::Parser::ParseExpression(SrcList &src, ValueLocation &vloc, ScopeType &
         UserError("Expected an expression, found '%s' instead", _sym.GetName(_src.GetNext()).c_str());
 
     size_t const expr_end = _src.GetCursor();
-    ParseExpression_Term(expression, vloc, scope_type, vartype);
+    ParseExpression_Term(expression, xres);
     _src.SetCursor(expr_end);
     return;
 }
 
-void AGS::Parser::ParseExpression(SrcList &src, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseIntegerExpression(SrcList &src, ExpressionResult &xres, std::string const &msg)
 {
-    ValueLocation vloc;
-
-    ParseExpression(_src, vloc, scope_type, vartype);
-    ResultToAX(vartype, vloc);
-}
-
-void AGS::Parser::ParseExpression(SrcList &src)
-{
-    ValueLocation vloc;
-    ScopeType scope_type;
-    Vartype vartype;
-
-    ParseExpression(src, vloc, scope_type, vartype);
-    ResultToAX(vartype, vloc);
-}
-
-void AGS::Parser::ParseIntegerExpression(SrcList &src, ValueLocation &vloc, std::string const &msg)
-{
-    Vartype vartype = kKW_NoSymbol;
-    ScopeType scope_type_dummy = ScT::kNone;
-    ParseExpression(src, vloc, scope_type_dummy, vartype);
+    ParseExpression(src, xres);
     
-    return CheckVartypeMismatch(vartype, kKW_Int, true, "Expected an integer expression");
+    return CheckVartypeMismatch(xres.Vartype, kKW_Int, true, msg);
 }
 
-void AGS::Parser::ParseDelimitedExpression(SrcList &src, Symbol const opener, ScopeType &scope_type, Vartype &vartype)
+void AGS::Parser::ParseDelimitedExpression(SrcList &src, Symbol const opener, ExpressionResult &xres)
 {
     Expect(opener, src.GetNext());
-    ParseExpression(src, scope_type, vartype);
+    ParseExpression(src, xres);
     Symbol const closer = _sym[opener].DelimeterD->Partner;
     return Expect(closer, src.GetNext());
 }
 
-void AGS::Parser::ParseDelimitedExpression(SrcList &src, Symbol const opener)
-{
-    ScopeType scope_type_dummy;
-    Vartype vartype_dummy;
-    return ParseDelimitedExpression(src, opener, scope_type_dummy, vartype_dummy);
-}
-
 // We are parsing the left hand side of a += or similar statement.
-void AGS::Parser::ParseAssignment_ReadLHSForModification(SrcList &expression, ScopeType &scope_type, ValueLocation &vloc, Vartype &vartype)
+void AGS::Parser::ParseAssignment_ReadLHSForModification(SrcList &expression, ExpressionResult &xres)
 {
-    AccessData(VAC::kReadingForLaterWriting, expression, vloc, scope_type, vartype);
+    AccessData(VAC::kReadingForLaterWriting, expression, xres);
     ParseExpression_CheckUsedUp(expression);
     
     // Also put the value into AX so that it can be read/modified as well as written
-    ValueLocation vloc_dummy = vloc; // Don't clobber vloc
-    ResultToAX(vartype, vloc_dummy);
+    ExpressionResult xres_dummy = xres;
+    ExpressionResultToAx(xres_dummy); // Don't clobber xres
 }
 
 // "var = expression"; lhs is the variable
 void AGS::Parser::ParseAssignment_Assign(SrcList &lhs)
 {
     _src.GetNext(); // Eat '='
-    ScopeType sct;
-    Vartype vartype;
-    ParseExpression(_src, sct, vartype); // RHS of the assignment
+    ExpressionResult xres;
+    ParseExpression(_src, xres); // RHS of the assignment
         
-    return AccessData_AssignTo(sct, vartype, lhs);
+    return AccessData_AssignTo(lhs, xres);
 }
 
 // We compile something like "var += expression"
-void AGS::Parser::ParseAssignment_MAssign(Symbol ass_symbol, SrcList &lhs)
+void AGS::Parser::ParseAssignment_MAssign(Symbol const ass_symbol, SrcList &lhs)
 {
     _src.GetNext(); // Eat assignment symbol
 
     // Parse RHS
-    ScopeType sct;
-    Vartype vartype;
-    ParseExpression(_src, sct, vartype);
-    
+    ExpressionResult rhs_xres;
+    ParseExpression(_src, rhs_xres);
+    ExpressionResultToAx(rhs_xres);
     PushReg(SREG_AX);
-    Vartype rhsvartype = vartype;
 
     // Parse LHS (moves the cursor to end of LHS, so save it and restore it afterwards)
-    ValueLocation vloc;
-    Vartype lhsvartype;
     size_t const end_of_rhs_cursor = _src.GetCursor();
-    ParseAssignment_ReadLHSForModification(lhs, sct, vloc, lhsvartype); 
-    _src.SetCursor(end_of_rhs_cursor); // move cursor back to end of RHS
+    ExpressionResult lhs_xres;
+    ParseAssignment_ReadLHSForModification(lhs, lhs_xres);
+    _src.SetCursor(end_of_rhs_cursor);
 
     // Use the operator on LHS and RHS
-    CodeCell const opcode = GetOpcode(ass_symbol, lhsvartype, rhsvartype);
-    PopReg(SREG_BX);
+    CodeCell const opcode = GetOpcode(ass_symbol, lhs_xres.Vartype, rhs_xres.Vartype);
+    PopReg(SREG_BX); // Note, we've pushed AX but we're popping BX
     _reg_track.SetRegister(SREG_BX);
     WriteCmd(opcode, SREG_AX, SREG_BX);
     _reg_track.SetRegister(SREG_AX);
 
-    RestorePoint before_write = RestorePoint(_scrip);
-    AccessData_AssignTo(sct, vartype, lhs);
-    
-    if (ValueLocation::kMAR_pointsto_value == vloc.location)
+    if (ExpressionResult::kLOC_MARPointsToValue == lhs_xres.Location)
     {
-        before_write.Restore();
         // Shortcut: Write the result directly back to memory
-        CodeCell memwrite = GetWriteCommandForSize(_sym.GetSize(lhsvartype));
+        CodeCell memwrite = GetWriteCommandForSize(_sym.GetSize(lhs_xres.Vartype));
         WriteCmd(memwrite, SREG_AX);
+        return;
     }
+
+    AccessData_AssignTo(lhs, rhs_xres);   
 }
 
 void AGS::Parser::ParseVardecl_InitialValAssignment_IntOrFloatVartype(Vartype const wanted_vartype, std::vector<char> &initial_val)
 {
-    ValueLocation vloc;
-    ScopeType scope_type;
-    Vartype vartype = kKW_NoSymbol;
-    ParseExpression(_src, vloc, scope_type, vartype);
+    ExpressionResult xres;
+    ParseExpression(_src, xres);
     
-    if (!vloc.IsCompileTimeLiteral())
+    if (xres.kTY_Literal != xres.Type)
         UserError("Cannot evaluate this expression at compile time, it cannot be used as initializer");
 
-    CodeCell const litval = _sym[vloc.symbol].LiteralD->Value;
+    CodeCell const litval = _sym[xres.Symbol].LiteralD->Value;
 
-    if ((kKW_Float == wanted_vartype) != (kKW_Float == vartype))
+    if ((kKW_Float == wanted_vartype) != (kKW_Float == xres.Vartype))
         UserError(
             "Expected a '%s' value after '=' but found a '%s' value instead",
             _sym.GetName(wanted_vartype).c_str(),
-            _sym.GetName(vartype).c_str());
+            _sym.GetName(xres.Vartype).c_str());
     
     size_t const wanted_size = _sym.GetSize(wanted_vartype);
     initial_val.resize(wanted_size);
@@ -4329,12 +4322,13 @@ void AGS::Parser::ParseVardecl_Local(Symbol var_name, Vartype vartype)
 
     // "readonly" vars cannot be assigned to, so don't use standard assignment function here.
     _src.GetNext(); // Eat '='
-    ScopeType scope_type;
-    Vartype rhsvartype;
-    ParseExpression(_src, scope_type, rhsvartype);
+    ExpressionResult rhs_xres;
+    ParseExpression(_src, rhs_xres);
+    ExpressionResultToAx(rhs_xres);
     
     // Vartypes must match. This is true even if the lhs is readonly.
     // As a special case, a string may be assigned a const string because the const string will be copied, not modified.
+    Vartype rhsvartype = rhs_xres.Vartype;
     Vartype const lhsvartype = vartype;
 
     if (IsVartypeMismatch_Oneway(rhsvartype, lhsvartype) &&
@@ -4884,23 +4878,22 @@ void AGS::Parser::ParseStruct_Attribute2SymbolTable(TypeQualifierSet tqs, Vartyp
     _sym[qualified_attribute].AttributeD->Vartype = vartype;
 
     // Declare attribute getter, e.g. get_ATTRIB()
-    Symbol unqualified_func = kKW_NoSymbol;
-    bool const get_func_is_setter = false;
-    ConstructAttributeFuncName(qualified_attribute, get_func_is_setter, is_indexed, unqualified_func);
-    Symbol const get_func = MangleStructAndComponent(name_of_struct, unqualified_func);
-    _sym[qualified_attribute].AttributeD->Getter = get_func;
-    ParseStruct_Attribute_DeclareFunc(tqs, name_of_struct, get_func, unqualified_func, get_func_is_setter, is_indexed, vartype);
-    _sym.SetDeclared(get_func, declaration_start);
+    Symbol const unqualified_getter =
+        ConstructAttributeFuncName(qualified_attribute, false, is_indexed);
+    Symbol const qualified_getter = MangleStructAndComponent(name_of_struct, unqualified_getter);
+    _sym[qualified_attribute].AttributeD->Getter = qualified_getter;
+    ParseStruct_Attribute_DeclareFunc(tqs, name_of_struct, qualified_getter, unqualified_getter, false, is_indexed, vartype);
+    _sym.SetDeclared(qualified_getter, declaration_start);
 
     if (!is_readonly)
     {
         // Declare attribute setter, e.g. set_ATTRIB(value)
-        bool const set_func_is_setter = true;
-        ConstructAttributeFuncName(qualified_attribute, set_func_is_setter, is_indexed, unqualified_func);
-        Symbol const set_func = MangleStructAndComponent(name_of_struct, unqualified_func);
-        _sym[qualified_attribute].AttributeD->Setter = set_func;
-        ParseStruct_Attribute_DeclareFunc(tqs, name_of_struct, set_func, unqualified_func, set_func_is_setter, is_indexed, vartype);
-        _sym.SetDeclared(set_func, declaration_start);
+        Symbol const unqualified_setter =
+            ConstructAttributeFuncName(qualified_attribute, true, is_indexed);
+        Symbol const qualified_setter = MangleStructAndComponent(name_of_struct, unqualified_setter);
+        _sym[qualified_attribute].AttributeD->Setter = qualified_setter;
+        ParseStruct_Attribute_DeclareFunc(tqs, name_of_struct, qualified_setter, unqualified_setter, true, is_indexed, vartype);
+        _sym.SetDeclared(qualified_setter, declaration_start);
     }
 }
 
@@ -4987,18 +4980,18 @@ void AGS::Parser::ParseArray(Symbol vname, Vartype &vartype)
         msg.replace(msg.find("<arr>"), 5u, _sym.GetName(vname).c_str());
         Symbol const first_sym = _src.PeekNext();
 
-        ValueLocation vloc;
+        ExpressionResult xres;
         int const cursor = _src.GetCursor();
         SkipTo(kKW_Comma, _src);
         SrcList expression = SrcList(_src, cursor, _src.GetCursor() - cursor);
         expression.StartRead();
-        ParseIntegerExpression(expression, vloc, msg);
-        if (!vloc.IsCompileTimeLiteral())
+        ParseIntegerExpression(expression, xres, msg);
+        if (xres.kTY_Literal != xres.Type)
             UserError(
                 (msg + "Cannot evaluate the expression starting with '%s' at compile time").c_str(),
                 _sym.GetName(first_sym).c_str());
             
-        CodeCell const dimension_as_int = _sym[vloc.symbol].LiteralD->Value;
+        CodeCell const dimension_as_int = _sym[xres.Symbol].LiteralD->Value;
         if (dimension_as_int < 1)
             UserError(
                 "Array dimension #%u of array '%s' must be at least 1 but is %d instead",
@@ -5842,17 +5835,15 @@ void AGS::Parser::ParseReturn(Symbol name_of_current_func)
             UserError("Cannot return a value from a 'void' function");
 
         // parse what is being returned
-        ScopeType scope_type;
-        Vartype vartype;
-        ParseExpression(_src, scope_type, vartype);
-        
-        ConvertAXStringToStringObject(functionReturnType, vartype);
+        ExpressionResult xres;
+        ParseExpression(_src, xres);
+        ExpressionResultToAx(xres);
+        ConvertAXStringToStringObject(functionReturnType, xres.Vartype);
 
         // check whether the return type is correct
-        CheckVartypeMismatch(vartype, functionReturnType, true, "");
-        
-        if (_sym.IsOldstring(vartype) && (ScT::kLocal == scope_type))
-            UserError("Cannot return a local 'string' from a function");
+        CheckVartypeMismatch(xres.Vartype, functionReturnType, true, "");
+        if (_sym.IsOldstring(xres.Vartype) && xres.LocalNonParameter)
+            UserError("Cannot return a local 'string' variable");
     }
     else if (_sym.IsAnyIntegerVartype(functionReturnType))
     {
@@ -5894,9 +5885,8 @@ void AGS::Parser::ParseReturn(Symbol name_of_current_func)
 // Evaluate the header of an "if" clause, e.g. "if (i < 0)".
 void AGS::Parser::ParseIf()
 {
-    ScopeType scope_type_dummy;
-    Vartype vartype;
-    ParseDelimitedExpression(_src, kKW_OpenParenthesis, scope_type_dummy, vartype);
+    ExpressionResult xres;
+    ParseDelimitedExpression(_src, kKW_OpenParenthesis, xres);
     
     _nest.Push(NSType::kIf);
 
@@ -5939,7 +5929,9 @@ void AGS::Parser::ParseWhile()
     // point to the start of the code that evaluates the condition
     CodeLoc const condition_eval_loc = _scrip.codesize;
 
-    ParseDelimitedExpression(_src, kKW_OpenParenthesis);
+    ExpressionResult xres;
+    ParseDelimitedExpression(_src, kKW_OpenParenthesis, xres);
+    CheckVartypeMismatch(xres.Vartype, kKW_Int, true, "'while' clause");
     
     _nest.Push(NSType::kWhile);
 
@@ -5998,10 +5990,9 @@ void AGS::Parser::HandleEndOfBraceCommand()
         _nest.JumpOutLevel() = jumpout_level;
 }
 
-void AGS::Parser::ParseAssignmentOrExpression(Symbol cursym)
+void AGS::Parser::ParseAssignmentOrExpression()
 {    
     // Get expression
-    _src.BackUp(); // Expression starts with cursym: the symbol in front of the cursor.
     size_t const expr_start = _src.GetCursor();
     SkipToEndOfExpression();
     SrcList expression = SrcList(_src, expr_start, _src.GetCursor() - expr_start);
@@ -6015,7 +6006,12 @@ void AGS::Parser::ParseAssignmentOrExpression(Symbol cursym)
     default:
     {
         // No assignment symbol following: This is an isolated expression, e.g., a function call
-        ParseSideEffectExpression(expression);
+        ExpressionResult xres;
+        size_t const expr_end = _src.GetCursor();
+        ParseExpression_Term(expression, xres, false);
+        if (!xres.SideEffects)
+            Warning("This expression doesn't have any effect");
+        _src.SetCursor(expr_end);
         return;
     }
 	
@@ -6065,7 +6061,7 @@ void AGS::Parser::ParseFor_InitClause(Symbol peeksym)
         return; // Empty init clause
     if (_sym.IsVartype(peeksym))
         return ParseFor_InitClauseVardecl();
-    return ParseAssignmentOrExpression(_src.GetNext());
+    return ParseAssignmentOrExpression();
 }
 
 void AGS::Parser::ParseFor_WhileClause()
@@ -6081,7 +6077,10 @@ void AGS::Parser::ParseFor_WhileClause()
         return;
     }
 
-    return ParseExpression(_src);
+    ExpressionResult xres;
+    ParseExpression(_src, xres);
+    ExpressionResultToAx(xres);
+    CheckVartypeMismatch(xres.Vartype, kKW_Int, true, "Second clause in 'for' statement");
 }
 
 void AGS::Parser::ParseFor_IterateClause()
@@ -6089,7 +6088,7 @@ void AGS::Parser::ParseFor_IterateClause()
     if (kKW_CloseParenthesis == _src.PeekNext())
         return; // iterate clause is empty
 
-    return ParseAssignmentOrExpression(_src.GetNext());
+    return ParseAssignmentOrExpression();
 }
 
 void AGS::Parser::ParseFor()
@@ -6149,12 +6148,10 @@ void AGS::Parser::ParseSwitch()
     RestorePoint rp{ _scrip };
 
     // Get the switch expression
-    ScopeType scope_type_dummy;
-    Vartype vartype;
-    ParseDelimitedExpression(_src, kKW_OpenParenthesis, scope_type_dummy, vartype);
-    
+    ExpressionResult xres;
+    ParseDelimitedExpression(_src, kKW_OpenParenthesis, xres);
+
     Expect(kKW_OpenBrace, _src.GetNext());
-    
     if (kKW_CloseBrace == _src.PeekNext())
     {
         // A switch without any clauses, tantamount to a NOP
@@ -6164,11 +6161,12 @@ void AGS::Parser::ParseSwitch()
     }
 
     // Copy the result to the BX register, ready for case statements
+    ExpressionResultToAx(xres);
     WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_BX);
     _reg_track.SetRegister(SREG_BX);
 
     _nest.Push(NSType::kSwitch);
-    _nest.SetSwitchExprVartype(vartype);
+    _nest.SetSwitchExprVartype(xres.Vartype);
 
     // Jump to the jump table
     _scrip.WriteCmd(SCMD_JMP, kDestinationPlaceholder);
@@ -6226,16 +6224,16 @@ void AGS::Parser::ParseSwitchLabel(Symbol case_or_default)
         // Compile a comparison of the switch expression result (which is in SREG_BX)
         // to the current case
 
-        Vartype vartype;
+        ExpressionResult xres;
         RegisterGuard(SREG_BX,
             [&]
             {
-                ScopeType scope_type_dummy;
-                return  ParseExpression(_src, scope_type_dummy, vartype); 
+                ParseExpression(_src, xres);
+                ExpressionResultToAx(xres);
             });
                         
         // Vartypes of the "case" expression and the "switch" expression must match
-        CheckVartypeMismatch(vartype, _nest.SwitchExprVartype(), false, "");
+        CheckVartypeMismatch(xres.Vartype, _nest.SwitchExprVartype(), false, "");
     }
 
     // Rip out the already generated code for the case expression and store it with the switch
@@ -6258,17 +6256,20 @@ void AGS::Parser::RemoveLocalsFromStack(size_t nesting_level)
     }
 }
 
-void AGS::Parser::SetCompileTimeLiteral(Symbol const lit, ValueLocation &vloc, Vartype &vartype)
+void AGS::Parser::SetCompileTimeLiteral(Symbol const lit, ExpressionResult &xres)
 {
     if (!_sym.IsLiteral(lit))
         InternalError("'%s' isn't literal", _sym.GetName(lit).c_str());
-	
-    vartype = _sym[lit].LiteralD->Vartype;
-    vloc.location = ValueLocation::kCompile_time_literal;
-    vloc.symbol = lit;
 
-    if (kKW_String == _sym.VartypeWithout(VTT::kConst, vartype))
-        ResultToAX(vartype, vloc); // Cannot handle string literals
+    xres.Type = xres.kTY_Literal;
+    xres.Location = xres.kLOC_Symbol;
+    xres.Symbol = lit;
+    xres.Vartype = _sym[lit].LiteralD->Vartype;
+    xres.Modifiable = false;
+    xres.LocalNonParameter = false;
+
+    if (kKW_String == _sym.VartypeWithout(VTT::kConst, xres.Vartype))
+        ExpressionResultToAx(xres); // Cannot handle string literals
 }
 
 void AGS::Parser::FindOrAddIntLiteral(CodeCell value, Symbol &symb)
@@ -6390,7 +6391,8 @@ void AGS::Parser::ParseCommand(Symbol leading_sym, Symbol &struct_of_current_fun
     default:
     {
         // No keyword, so it should be an assignment or an isolated expression
-        ParseAssignmentOrExpression(leading_sym);
+        _src.BackUp();
+        ParseAssignmentOrExpression();
         Expect(kKW_Semicolon, _src.GetNext());
         break;
     }
@@ -6470,10 +6472,13 @@ void AGS::Parser::ParseCommand(Symbol leading_sym, Symbol &struct_of_current_fun
 void AGS::Parser::RegisterGuard(RegisterList const &guarded_registers, std::function<void(void)> block)
 {
     RestorePoint rp(_scrip);
-    CodeLoc const codesize_at_start = rp.CodeLocation();
+    RegisterTracking::TickT const tick_at_start = _reg_track.GetTick();
     size_t const cursor_at_start = _src.GetCursor();
 
-    size_t register_set_point[CC_NUM_REGISTERS];
+    // Save the current MAR manager in case it gets clobbered and needs to be restored
+    MarMgr save_mar_state(_marMgr);
+
+    RegisterTracking::TickT register_set_point[CC_NUM_REGISTERS];
     for (auto it = guarded_registers.begin(); it != guarded_registers.end(); ++it)
         register_set_point[*it] = _reg_track.GetRegister(*it);
 
@@ -6483,7 +6488,7 @@ void AGS::Parser::RegisterGuard(RegisterList const &guarded_registers, std::func
     // Find out what guarded registers have been clobbered since start of block
     std::vector<size_t> pushes;
     for (auto it = guarded_registers.begin(); it != guarded_registers.end(); ++it)
-        if (!_reg_track.IsValid(*it, codesize_at_start))
+        if (!_reg_track.IsValid(*it, tick_at_start))
             pushes.push_back(*it);
     if (pushes.empty())
         return;
@@ -6504,6 +6509,8 @@ void AGS::Parser::RegisterGuard(RegisterList const &guarded_registers, std::func
     for (auto it = pushes.rbegin(); it != pushes.rend(); ++it)
     {
         PopReg(*it);
+        if (*it == SREG_MAR)
+            _marMgr = save_mar_state; // Restore potentially clobbered MAR manager
         // We know that we're popping the same register that we've pushed,
         // so it is safe to reset the set point to the point that was
         // valid at the time of that push.

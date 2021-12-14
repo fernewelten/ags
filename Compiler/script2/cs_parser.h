@@ -553,19 +553,16 @@ private:
 
     // Find the index of the operator in the list that binds the least
     // so that either side of it can be evaluated first. -1 if no operator was found
-    void IndexOfLeastBondingOperator(SrcList &expression, int &idx);
+    int IndexOfLeastBondingOperator(SrcList &expression);
 
     // Also check whether the operator can handle the types at all
-    void GetOpcode(Symbol op_sym, Vartype vartype1, Vartype vartype2, CodeCell &opcode);
+    CodeCell GetOpcode(Symbol op_sym, Vartype vartype1, Vartype vartype2);
 
     // Check for a type mismatch in one direction only
     bool IsVartypeMismatch_Oneway(Vartype vartype_is, Vartype vartype_wants_to_be) const;
 
     // Check whether there is a type mismatch; if so, give an error. 'msg' for specializing the error message
     void CheckVartypeMismatch(Vartype vartype_is, Vartype vartype_wants_to_be, bool orderMatters, std::string const &msg);
-
-    // Whether this operator's vartype is always bool
-    static bool IsBooleanOpcode(CodeCell opcode);
 
     // 'current_vartype' must be the vartype of AX. If it is 'string' and
     // wanted_vartype is 'String', then AX will be converted to 'String'.
@@ -607,8 +604,8 @@ private:
     void AccessData_FunctionCall(Symbol name_of_func, SrcList &expression, MemoryLocation &mloc, Vartype &rettype);
 
     // Evaluate 'vloc_lhs op_sym vloc_rhs' at compile time, return the result in 'vloc'.
-    // Return in 'possible' whether this is possible.
-    void ParseExpression_CompileTime(Symbol op_sym, ValueLocation const &vloc_lhs, ValueLocation const &vloc_rhs, bool &possible, ValueLocation &vloc);
+    // Return whether this is possible.
+    bool ParseExpression_CompileTime(Symbol op_sym, ValueLocation const &vloc_lhs, ValueLocation const &vloc_rhs, ValueLocation &vloc);
 
     // Check the vartype following "new"
     void ParseExpression_CheckArgOfNew(Vartype new_vartype);

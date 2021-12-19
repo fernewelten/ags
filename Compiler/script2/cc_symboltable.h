@@ -38,6 +38,7 @@ enum class VTF : size_t // Vartype flag
     kUndefined = 0,     // Undefined or only forward-defined
     kAutoptr,           // Will be displayed without the '*'
     kBuiltin,           // May not be instantiated with new (but new[] is okay)
+    kDelegate,          // Is a delegate
     kEnum,              // Is an enum
     kIntegerVartype,    // Is any type of integer, e.g., int, 'enum's etc.
     kManaged,           // Must be instantiated with new or new[]
@@ -173,6 +174,7 @@ enum Predefined : Symbol
     kKW_Const,          // "const"
     kKW_Continue,       // "continue"
     kKW_Default,        // "cefault"
+    kKW_Delegate,       // "delegate"
     kKW_Do,             // "do"
     kKW_DotDotDot,      // "..."
     kKW_Else,           // "else"
@@ -458,6 +460,10 @@ public:
     // Start search with the components of ancestor.
     Symbol FindStructComponent(Symbol strct, Symbol component, Symbol ancestor) const;
     inline Symbol *FindStructComponent(Symbol strct, Symbol component) const { FindStructComponent(strct, component, strct); }
+
+    // Delegate types
+    inline bool IsDelegateVartype(Symbol s) { return IsVTF(s, VTF::kDelegate);
+    }
 
     // Arrays and variables that are arrays
     // The "Array[...] of vartype" vartype

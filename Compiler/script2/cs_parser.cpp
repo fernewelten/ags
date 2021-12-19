@@ -1346,7 +1346,6 @@ void AGS::Parser::ParseFuncdecl_MasterData2Sym(TypeQualifierSet tqs, Vartype ret
     }
 }
 
-// there was a forward declaration -- check that the real declaration matches it
 void AGS::Parser::ParseFuncdecl_CheckThatKnownInfoMatches(std::string const &func_name, SymbolTableEntry::FunctionDesc const *this_entry, SymbolTableEntry::FunctionDesc const *known_info, size_t const known_declared, bool body_follows)
 {
     if (!known_info)
@@ -1696,10 +1695,10 @@ int AGS::Parser::IndexOfLeastBondingOperator(SrcList &expression)
         largest_is_prefix = is_prefix;
     } // while (!expression.ReachedEOF())
 
-    // If a prefix operator turns out not to be in first position,
+    // If this prefix operator turns out not to be in first position,
     // it must be the end of a chain of unary operators and the first
     // of those should be evaluated first
-    return (largest_is_prefix) ? 0 : index_of_largest;
+    return largest_is_prefix ? 0 : index_of_largest;
 }
 
 // Change the generic opcode to the one that is correct for the vartypes
@@ -2874,30 +2873,276 @@ void AGS::Parser::AccessData_GenerateFunctionCall(Symbol name_of_func, size_t nu
     }
 }
 
-void AGS::Parser::AccessData_GenerateDynarrayLengthFuncCall(ExpressionResult &xres)
+Symbol AGS::Parser::DeclareExternalImportFunction(std::string const &name, Vartype vt1, Vartype vt2, Vartype vt3, Vartype vt4)
 {
-    // Load MAR with the address of the dynarray. Will provoke a runtime error when NULL
-    AccessData_Dereference(xres);
+    Symbol const external_func = _sym.FindOrAdd(name);
 
-    // We calculate the length of the dynarray by calling an external function.
     // Ensure that this function is declared as an import function
-    std::string const dynarray_len_func_name = "__Builtin_DynamicArrayLength";
-    Symbol const dynarray_len_func = _sym.FindOrAdd(dynarray_len_func_name);
-    if (!_sym.IsFunction(dynarray_len_func))
+    if (!_sym.IsFunction(external_func))
     {
         TypeQualifierSet tqs;
         tqs[TQ::kImport] = true;
         Symbol const no_struct = kKW_NoSymbol;
         bool const body_follows = false;
-        ParseFuncdecl_MasterData2Sym(tqs, kKW_Int, no_struct, dynarray_len_func, body_follows);
-        _sym[dynarray_len_func].FunctionD->Parameters.push_back({});
-        _sym[dynarray_len_func].FunctionD->Parameters[1u].Vartype = xres.Vartype;
-        _sym[dynarray_len_func].FunctionD->Offset = _scrip.FindOrAddImport(_sym.GetName(dynarray_len_func));
-        strcat(_scrip.imports[_sym[dynarray_len_func].FunctionD->Offset], "^1");
-        _sym.SetDeclared(dynarray_len_func, _src.GetCursor());
+        ParseFuncdecl_MasterData2Sym(tqs, kKW_Int, no_struct, external_func, body_follows);
+        _sym[external_func].FunctionD->Offset = _scrip.FindOrAddImport(_sym.GetName(external_func));
+        strcat(_scrip.imports[_sym[external_func].FunctionD->Offset], "^1");
+        _sym.SetDeclared(external_func, _src.GetCursor());
     }
-    _sym[dynarray_len_func].Accessed = true;
+    _sym[external_func].FunctionD->Parameters.push_back({});
+    _sym[external_func].FunctionD->Parameters[1u].Vartype = vt1;
 
+    if (kKW_Void == vt2)
+        return;
+    _sym[external_func].FunctionD->Parameters.push_back({});
+    _sym[external_func].FunctionD->Parameters[1u].Vartype = vt2;
+       
+   if (kKW_Void == vt3)
+        return;
+    _sym[external_func].FunctionD->Parameters.push_back({});
+    _sym[external_func].FunctionD->Parameters[1u].Vartype = vt3;
+       
+   if (kKW_Void == vt4)
+        return;
+    _sym[external_func].FunctionD->Parameters.push_back({});
+    _sym[external_func].FunctionD->Parameters[1u].Vartype = vt4;
+       
+    _sym[external_func].Accessed = true;
+}
+
+void AGS::Parser::AccessData_Delegate_CheckFuncParam(std::string const &func_name, Vartype const delg, Symbol const func)
+{
+    if (!_sym.IsFunction(func))
+        InternalError("Non-function as parameter of delegate '%s'", func_name.c_str());
+    if (!_sym.IsFunction(delg))
+        InternalError("Delegate vartype '%s' isn't function", _sym.GetName(delg).c_str());
+
+    auto &delg_f = *_sym[delg].FunctionD;
+    auto &func_f = *_sym[func].FunctionD;
+
+    Vartype const delg_ret_vartype = delg_f.Parameters[0u].Vartype;
+    Vartype const func_ret_vartype = func_f.Parameters[0u].Vartype;
+    if (kKW_Void != delg_ret_vartype && func_ret_vartype != delg_ret_vartype)
+        UserError(
+            ReferenceMsgSym(ReferenceMsgSym(
+                "Function '%s' must have the return type '%s' but has '%s'", func), delg).c_str(),
+            _sym.GetName(func).c_str(),
+            _sym.GetName(delg_ret_vartype).c_str(),
+            _sym.GetName(func_ret_vartype).c_str());
+
+    size_t const delg_param_count = delg_f.Parameters.size();
+    size_t const func_param_count = func_f.Parameters.size();
+    if (func_param_count != delg_param_count)
+        UserError(
+            ReferenceMsgSym(ReferenceMsgSym(
+                "Function '%s' must have '%u' parameters but has '%u'", func), delg).c_str(),
+            _sym.GetName(func).c_str(),
+            delg_param_count,
+            func_param_count);
+    for (size_t param = 1u; param < delg_param_count; param++) // note, 1u
+    {
+        Vartype const delg_vartype = delg_f.Parameters[param].Vartype;
+        Vartype const func_vartype = func_f.Parameters[param].Vartype;
+        if (func_vartype != delg_vartype)
+            UserError(
+                ReferenceMsgSym(ReferenceMsgSym(
+                    "Parameter #%u of function '%s' must be type'%s' but is type '%s'", func), delg).c_str(),
+                _sym.GetName(func).c_str(),
+                _sym.GetName(delg_vartype).c_str(),
+                _sym.GetName(func_vartype).c_str());
+    }
+}
+
+void AGS::Parser::AccessData_Delegate_GenerateFuncCall(const std::string &xfunc_name, CodeLoc offset, Vartype vartype)
+{
+    // Load parameters onto far stack
+    // function
+    WriteCmd(SCMD_LITTOREG, SREG_AX, offset);
+    _scrip.FixupPrevious(kFx_Import);
+    _reg_track.SetRegister(SREG_AX);
+    WriteCmd(SCMD_PUSHREAL, SREG_AX);
+    // Object of function
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR);
+    // Delegate
+    WriteCmd(SCMD_REGTOREG, SREG_CX, SREG_MAR);
+    _reg_track.SetRegister(SREG_MAR);
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR);
+
+    Symbol const external_func =
+        DeclareExternalImportFunction(xfunc_name, vartype);
+    AccessData_GenerateFunctionCall(external_func, 1u, true);   
+}
+
+void AGS::Parser::AccessData_Delegate_Func1Param(std::string const &func_name, std::string const &xfunc_name, Vartype const delg, SrcList &expression, ExpressionResult &xres)
+{
+    // Load MAR with the address of the delegate object. Will provoke a runtime error when NULL
+    AccessData_Dereference(xres);
+    WriteCmd(SCMD_REGTOREG, SREG_MAR, SREG_CX);
+    _reg_track.SetRegister(SREG_CX);
+
+    ExpressionResult xres_param;
+    size_t const cursor = expression.GetCursor();
+    RegisterGuard(SREG_CX,
+        [&]
+        {
+            expression.SetCursor(cursor);
+            ParseDelimitedExpression(expression, kKW_OpenParenthesis, xres_param);
+        });
+
+    if (xres_param.kTY_FunctionName != xres.Type)
+        UserError("Expected a function as the parameter of delegate '%s'", func_name.c_str());
+
+    Symbol const func = xres_param.Symbol;
+    AccessData_Delegate_CheckFuncParam(func_name, delg, func);
+    auto const offset = _sym[func].FunctionD->Offset;   
+
+    if (kKW_NoSymbol == xres_param.Vartype)
+    {
+        WriteCmd(SCMD_LITTOREG, SREG_MAR, 0);
+        _reg_track.SetRegister(SREG_MAR);
+    }
+    else
+    {
+        AccessData_Dereference(xres);
+    }
+
+    AccessData_Delegate_GenerateFuncCall(xfunc_name, offset, xres.Vartype);
+
+    xres.Type = xres.kTY_Literal;
+    xres.Location = xres.kLOC_Symbol;
+    xres.Symbol = kKW_Null;
+    xres.Vartype = kKW_Null;
+    xres.Modifiable = false;
+}
+
+void AGS::Parser::AccessData_Delegate_Add(Vartype delg, SrcList & expression, ExpressionResult & xres)
+{
+    AccessData_Delegate_Func1Param(PseudoAttribute::kDelegateAdd, BuiltinFName::kDelegateAdd, delg, expression, xres);
+}
+
+void AGS::Parser::AccessData_Delegate_Clear(SrcList &expression, ExpressionResult &xres)
+{
+    // Call external function to clear
+    Symbol const clear_func = DeclareExternalImportFunction(BuiltinFName::kDelegateClear, xres.Vartype);
+
+    // Load MAR with the address of the delegate. Will provoke a runtime error when NULL
+    AccessData_Dereference(xres);
+
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR); // Load the delegate onto the far stack
+    AccessData_GenerateFunctionCall(clear_func, 1u, true);
+
+    xres.Type = xres.kTY_Literal;
+    xres.Location = xres.kLOC_Symbol;
+    xres.Symbol = kKW_Null;
+    xres.Vartype = kKW_Null;
+    xres.Modifiable = false;
+}
+
+void AGS::Parser::AccessData_Delegate_Invoke(Symbol delg, SrcList &expression, ExpressionResult &xres)
+{
+    Symbol const begin_func = DeclareExternalImportFunction(BuiltinFName::kDelegateBegin, xres.Vartype);
+    Symbol const end_func = DeclareExternalImportFunction(BuiltinFName::kDelegateEnd, xres.Vartype);
+
+    // Load MAR with the address of the delegate. Will provoke a runtime error when NULL
+    AccessData_Dereference(xres);
+
+    size_t const num_args = AccessData_PushFunctionCallParams(delg, false, expression);
+
+    // TODO CX - address of 1 past the end of the parameters
+    // TODO Num of parameters
+
+    // We've got some parameters on the normal stack.
+    // The following code will go through all the functions in the delegate object;
+    // for each function, it will copy all the parameters to the 'real' stack and
+    // then CALLAS the function. 
+
+    // The delegate object contains blocks, one block per function.
+    // Each block contains 1. OP and 2. a function address with FIXUP already applied.
+    // Get the address of 1 past the last block from the delegate object
+    // and store it in DX
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR);
+    RegisterGuard(SREG_MAR,
+        [&]
+        {
+            AccessData_GenerateFunctionCall(end_func, 1u, true);
+        });
+    WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_DX);
+    
+    // Get the address of the first block from the delegate object
+    // and save it on the stack
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR);
+    RegisterGuard(SREG_MAR,
+        [&]
+        {
+            AccessData_GenerateFunctionCall(begin_func, 1u, true);
+        });
+    PushReg(SREG_AX);
+
+    // Loop through the delegate functions
+    BackwardJumpDest start_of_loop_through_delegate_functions(_scrip);
+    
+    // Copy the parameters on the 'normal' stack to the 'real' stack
+    WriteCmd(SCMD_REGTOREG, SREG_BX, SREG_MAR); // BX contains start of parameters
+    BackwardJumpDest start_of_loop_through_parameters(_scrip);
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR);
+    WriteCmd(SCMD_ADD, SREG_MAR, SIZE_OF_STACK_CELL);
+    WriteCmd(SCMD_REGTOREG, SREG_MAR, SREG_AX);
+    WriteCmd(SCMD_SUBREG, SREG_AX, SREG_CX);
+    start_of_loop_through_parameters.WriteJump(SCMD_JNZ, _src.GetLineno());
+
+    PopReg(SREG_AX); // Restore address of the function that we must do next
+    WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_MAR); // Load OP, for struct functions
+    WriteCmd(SCMD_MEMREADPTR, SREG_OP); 
+    WriteCmd(SCMD_ADDREG, SREG_AX, SIZE_OF_STACK_CELL);
+    PushReg(SREG_AX);
+    // Get call address. The fixup has already been applied before the address
+    // had been stored in the delegate.
+    WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_MAR); 
+    WriteCmd(SCMD_MEMREADPTR, SREG_AX);
+    WriteCmd(SCMD_CALLAS); // Call function
+    // TODO: Clean the 'real' stack
+    PopReg(SREG_AX);
+    WriteCmd(SCMD_ADDREG, SREG_AX, SIZE_OF_STACK_CELL);
+    PushReg(SREG_AX); // Save address of the function that we must do next.
+    WriteCmd(SCMD_SUBREG, SREG_AX, SREG_DX);
+    
+    start_of_loop_through_delegate_functions.WriteJump(SCMD_JNZ, _src.GetLineno());
+    PopReg(SREG_BX); // Don't clobber AX
+
+    // TODO Unload the 'normal' stack
+}
+
+void AGS::Parser::AccessData_Delegate_Remove(Vartype delg, SrcList &expression, ExpressionResult  &xres)
+{
+    AccessData_Delegate_Func1Param(PseudoAttribute::kDelegateRemove, BuiltinFName::kDelegateRemove, delg, expression, xres);
+}
+
+void AGS::Parser::AccessData_Delegate(SrcList &expression, ExpressionResult &xres)
+{
+    Symbol const delg = _sym.VartypeWithout(VTT::kDynpointer, xres.Vartype);
+    Symbol const func = expression.PeekNext();
+    expression.GetNext(); // eat func
+
+    if (_sym.Find("Add") == func)
+        AccessData_Delegate_Add(delg, expression, xres);
+    else if (_sym.Find("Clear") == func)
+        AccessData_Delegate_Clear(expression, xres);
+    else if (_sym.Find("Invoke") == func)
+        AccessData_Delegate_Invoke(delg, expression, xres);
+    else if (_sym.Find("Remove") == func)
+        AccessData_Delegate_Remove(delg, expression, xres);
+    else
+        UserError("Unknown delegate function '%s'", _sym.GetName(func).c_str());
+}
+
+void AGS::Parser::AccessData_DynarrayLength(ExpressionResult &xres)
+{
+    // Load MAR with the address of the dynarray. Will provoke a runtime error when NULL
+    AccessData_Dereference(xres);
+
+    // Call external function to calculate
+    Symbol const dynarray_len_func
+        = DeclareExternalImportFunction(BuiltinFName::kArrayLength, xres.Vartype);
     WriteCmd(SCMD_PUSHREAL, SREG_MAR); // Load the dynarray address onto the far stack
     AccessData_GenerateFunctionCall(dynarray_len_func, 1u, true);
 
@@ -2908,43 +3153,37 @@ void AGS::Parser::AccessData_GenerateDynarrayLengthFuncCall(ExpressionResult &xr
     xres.Modifiable = false;
 }
 
-// We are processing a function call.
-// Get the parameters of the call and push them onto the stack.
-void AGS::Parser::AccessData_PushFunctionCallParams(Symbol name_of_func, bool func_is_import, SrcList &parameters, size_t &actual_num_args)
+size_t AGS::Parser::AccessData_PushFunctionCallParams(Symbol name_of_func, bool func_is_import, SrcList &parameters)
 {
     size_t const num_func_args = _sym.NumOfFuncParams(name_of_func);
 
-    size_t num_supplied_args = 0;
+    size_t num_supplied_args = 0u;
     size_t closed_paren_idx;
     AccessData_FunctionCall_CountAndCheckParm(parameters, name_of_func, closed_paren_idx, num_supplied_args);
     
     // Push default parameters onto the stack when applicable
     // This will give an error if there aren't enough default parameters
     if (num_supplied_args < num_func_args)
-    {
         AccessData_FunctionCall_ProvideDefaults(num_func_args, num_supplied_args, name_of_func, func_is_import);
-    }
 	
     if (num_supplied_args > num_func_args && !_sym.IsVariadicFunc(name_of_func))
         UserError("Expected just %d parameters but found %d", num_func_args, num_supplied_args);
     // ASSERT at this point, the number of parameters is okay
 
     // Push the explicit arguments of the function
-    if (num_supplied_args > 0)
-    {
+    if (num_supplied_args > 0u)
         AccessData_FunctionCall_PushParams(parameters, closed_paren_idx, num_func_args, num_supplied_args, name_of_func, func_is_import);
-    }
 
-    actual_num_args = std::max(num_supplied_args, num_func_args);
-    parameters.SetCursor(closed_paren_idx + 1); // Go to the end of the parameter list
+    parameters.SetCursor(closed_paren_idx + 1u); // Go to the end of the parameter list
+    return std::max(num_supplied_args, num_func_args);
 }
 
 void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expression, ExpressionResult &xres)
 {
-    if (kKW_OpenParenthesis != expression[1])
-        UserError("Expected '('");
-
     expression.EatFirstSymbol();
+    if (expression.Length() == 0u)
+        UserError("Expected '('");
+    Expect(kKW_OpenParenthesis, expression[0u]);
 
     auto const function_tqs = _sym[name_of_func].FunctionD->TypeQualifiers;
     bool const func_is_import = function_tqs[TQ::kImport];
@@ -2979,12 +3218,11 @@ void AGS::Parser::AccessData_FunctionCall(Symbol name_of_func, SrcList &expressi
         mar_pushed = true;
     }
 
-    size_t num_args = 0;
-    AccessData_PushFunctionCallParams(name_of_func, func_is_import, expression, num_args);
+    size_t const num_args = AccessData_PushFunctionCallParams(name_of_func, func_is_import, expression);
     
     if (called_func_uses_this)
     {
-        if (0 == num_args)
+        if (0u == num_args)
         {   // MAR must still be current, so undo the unneeded PUSH above.
             _scrip.OffsetToLocalVarBlock -= SIZE_OF_STACK_CELL;
             _scrip.codesize -= 2;
@@ -3087,7 +3325,6 @@ void AGS::Parser::ParseExpression_Term(SrcList &expression, ExpressionResult &xr
 // We access a component of a struct in order to read or write it.
 void AGS::Parser::AccessData_StructMember(Symbol component, VariableAccess access_type, bool access_via_this, SrcList &expression, ExpressionResult &xres)
 {
-    expression.GetNext(); // Eat component
     SymbolTableEntry &entry = _sym[component];
     auto const compo_tqs = entry.VariableD->TypeQualifiers;
 
@@ -3108,7 +3345,6 @@ void AGS::Parser::AccessData_StructMember(Symbol component, VariableAccess acces
         xres.Modifiable &&
         !compo_tqs[TQ::kReadonly] &&
         (access_via_this || (!compo_tqs[TQ::kWriteprotected] && !compo_tqs[TQ::kProtected]));
-
 }
 
 Symbol  AGS::Parser::ConstructAttributeFuncName(Symbol attribsym, bool is_setter, bool is_indexed)
@@ -3213,13 +3449,12 @@ void AGS::Parser::AccessData_CallAttributeFunc(bool is_setter, SrcList &expressi
 
 
 // Location contains a pointer to another address. Get that address.
-void AGS::Parser::AccessData_Dereference(ExpressionResult &xres)
+void AGS::Parser::AccessData_Dereference(ExpressionResult &xres, bool runtime_null_check)
 {
     if (ExpressionResult::kLOC_AX == xres.Location)
     {
         WriteCmd(SCMD_REGTOREG, SREG_AX, SREG_MAR);
         _reg_track.SetRegister(SREG_MAR);
-        WriteCmd(SCMD_CHECKNULL);
         xres.Location = ExpressionResult::kLOC_MARPointsToValue;
         _marMgr.Reset();
     }
@@ -3230,8 +3465,10 @@ void AGS::Parser::AccessData_Dereference(ExpressionResult &xres)
         // checks whether MAR == 0. So we need to do MAR := m[MAR] first.
         WriteCmd(SCMD_MEMREADPTR, SREG_MAR);
         _reg_track.SetRegister(SREG_MAR);
-        WriteCmd(SCMD_CHECKNULL);
     }
+
+    if (runtime_null_check)
+        WriteCmd(SCMD_CHECKNULL);
 }
 
 void AGS::Parser::AccessData_ProcessCurrentArrayIndex(size_t const idx, size_t const dim, size_t const factor, bool const is_dynarray, SrcList &expression)
@@ -3430,13 +3667,13 @@ void AGS::Parser::AccessData_FirstClause(VariableAccess access_type, SrcList &ex
         return;
     }
 
-    if (_sym.IsFunction(first_sym))
+    if (_sym.IsFunction(first_sym)) // Works for delegate vartypes, too
     {
         expression.GetNext(); // Eat function symbol
         if (kKW_OpenParenthesis != expression.PeekNext())
         {
-            // Return the function symbol as-is
-            xres.Type = xres.kTY_FunctionName;
+            // Return the function or delegate symbol as-is
+            xres.Type = _sym.IsDelegateVartype(first_sym) ? xres.kTY_DelegateVartypeName : xres.kTY_FunctionName;
             xres.Location = xres.kLOC_Symbol;
             xres.Symbol = first_sym;
             xres.Vartype = kKW_NoSymbol;
@@ -3564,19 +3801,29 @@ void AGS::Parser::AccessData_SubsequentClause(VariableAccess access_type, bool a
         return;
     }
 
-    if (_sym.IsFunction(qualified_component))
+    if (_sym.IsDelegateVartype(vartype) && _sym.Find("Invoke") == unqualified_component)
+    {
+        AccessData_Delegate_Invoke(vartype, expression, xres);
+        if (_sym.IsDynarrayVartype(xres.Vartype))
+            AccessData_ProcessArrayIndexIfThere(expression, xres);
+        return;
+    }
+
+    if (_sym.IsFunction(qualified_component)) // Works for delegates, too
     {
         if (static_access && !_sym[qualified_component].FunctionD->TypeQualifiers[TQ::kStatic])
-            UserError("Must specify a specific object for non-static function %s", _sym.GetName(qualified_component).c_str());
+            UserError("Must specify a specific object for the non-static %s %s",
+                _sym.IsDelegateVartype(qualified_component) ? "delegate" : "function",
+                _sym.GetName(qualified_component).c_str());
 
         expression.GetNext(); // Eat function symbol
         if (kKW_OpenParenthesis != expression.PeekNext())
         {
-            // Return the function symbol as-is
+            // Return the function or delegate vartype symbol as-is
             xres.Type = xres.kTY_FunctionName;
             xres.Location = xres.kLOC_Symbol;
             xres.Symbol = qualified_component;
-            xres.Vartype = kKW_NoSymbol;
+            xres.Vartype = vartype;
             xres.Modifiable = false;
             return;
         }
@@ -3671,7 +3918,7 @@ void AGS::Parser::AccessData(VariableAccess access_type, SrcList &expression, Ex
         {
             outer_vartype = xres.Symbol; // Static access
         }
-        else
+        else 
         {
             if (_sym.IsDynpointerVartype(xres.Vartype))
             {
@@ -3679,12 +3926,18 @@ void AGS::Parser::AccessData(VariableAccess access_type, SrcList &expression, Ex
                 xres.Vartype = _sym.VartypeWithout(VTT::kDynpointer, xres.Vartype);
             }
 
-            if (_sym.IsDynarrayVartype(xres.Vartype) && _sym.FindOrAdd("Length") == expression.PeekNext())
+            if (_sym.IsDelegateVartype(xres.Vartype))
+            {
+                // Pseudo functions for delegate objects
+                AccessData_Delegate(expression, xres);
+                implied_this_dot = false;
+                continue;
+            }
+            if (_sym.IsDynarrayVartype(xres.Vartype) && _sym.FindOrAdd(PseudoAttribute::kArrayLength) == expression.PeekNext())
             {
                 // Pseudo attribute 'Length' will get the length of the dynarray
                 expression.GetNext(); // eat 'Length'
-
-                AccessData_GenerateDynarrayLengthFuncCall(xres);
+                AccessData_DynarrayLength(xres);
                 implied_this_dot = false;
                 continue;
             }
@@ -3740,10 +3993,6 @@ void AGS::Parser::AccessData_StrCpy()
     _reg_track.SetAllRegisters();
 }
 
-// We are typically in an assignment LHS = RHS; the RHS has already been
-// evaluated, and the result of that evaluation is in AX.
-// Store AX into the memory location that corresponds to LHS, or
-// call the attribute function corresponding to LHS.
 void AGS::Parser::AccessData_AssignTo(SrcList &expression, ExpressionResult xres)
 {
     // We'll evaluate expression later on which moves the cursor,
@@ -3751,7 +4000,7 @@ void AGS::Parser::AccessData_AssignTo(SrcList &expression, ExpressionResult xres
     size_t const end_of_rhs_cursor = _src.GetCursor();
 
     ExpressionResult rhs_xres = xres;
-    if (ExpressionResult::kTY_Literal != rhs_xres.Type)
+    if (ExpressionResult::kTY_Literal != rhs_xres.Type && rhs_xres.kTY_FunctionName != rhs_xres.Type)
         ExpressionResultToAx(rhs_xres);
 
 
@@ -3780,6 +4029,9 @@ void AGS::Parser::AccessData_AssignTo(SrcList &expression, ExpressionResult xres
                 rhs_xres.Location = ExpressionResult::kLOC_MARPointsToValue;
             }
         });
+
+    if (_sym.IsDelegateVartype(lhs_xres.Vartype))
+        return ParseAssignment_Assign_Delegate(lhs_xres, rhs_xres);
 
     ExpressionResultToAx(rhs_xres);
 
@@ -3969,6 +4221,19 @@ void AGS::Parser::ParseAssignment_ReadLHSForModification(SrcList &expression, Ex
     ExpressionResultToAx(xres_dummy); // Don't clobber xres
 }
 
+void AGS::Parser::ParseAssignment_Assign_Delegate(ExpressionResult const &lhs_xres, ExpressionResult const &rhs_xres)
+{
+    if (rhs_xres.Vartype != kKW_Null)
+        UserError("Can only assign 'null' to a delegate object (did you mean '+=' instead of '='?)");
+
+    // TODO: Get rid of RHS, it's null anyway. Get LHS into MAR
+    WriteCmd(SCMD_PUSHREAL, SREG_MAR);
+
+    Symbol const external_func =
+        DeclareExternalImportFunction(BuiltinFName::kDelegateClear, rhs_xres.Vartype);
+    AccessData_GenerateFunctionCall(external_func, 1u, true);
+}
+
 // "var = expression"; lhs is the variable
 void AGS::Parser::ParseAssignment_Assign(SrcList &lhs)
 {
@@ -3979,6 +4244,30 @@ void AGS::Parser::ParseAssignment_Assign(SrcList &lhs)
     return AccessData_AssignTo(lhs, xres);
 }
 
+void AGS::Parser::ParseAssignment_MAssign_Delegate(Symbol ass_symbol, ExpressionResult const &lhs_xres, const ExpressionResult &rhs_xres)
+{
+    Symbol const func = rhs_xres.Symbol;
+    if (!_sym.IsFunction(func))
+        InternalError("Non-function for delegate '%s'", _sym.GetName(ass_symbol).c_str());
+    size_t const offset = _sym[func].FunctionD->Offset;
+
+    // TODO: Generate an instruction that moves the delegate address to CX
+
+    switch (ass_symbol)
+    {
+    default:
+        return Expect(SymbolList{ kKW_Assign, kKW_AssignMinus, kKW_AssignPlus }, ass_symbol);
+
+    case kKW_AssignMinus:
+        AccessData_Delegate_GenerateFuncCall(BuiltinFName::kDelegateRemove, offset, lhs_xres.Vartype);
+        return;
+
+    case kKW_AssignPlus:
+        AccessData_Delegate_GenerateFuncCall(BuiltinFName::kDelegateAdd, offset, lhs_xres.Vartype);
+        return;
+    }
+}
+
 // We compile something like "var += expression"
 void AGS::Parser::ParseAssignment_MAssign(Symbol const ass_symbol, SrcList &lhs)
 {
@@ -3987,13 +4276,22 @@ void AGS::Parser::ParseAssignment_MAssign(Symbol const ass_symbol, SrcList &lhs)
     // Parse RHS
     ExpressionResult rhs_xres;
     ParseExpression(_src, rhs_xres);
-    ExpressionResultToAx(rhs_xres);
-    PushReg(SREG_AX);
+    if (rhs_xres.kTY_FunctionName != rhs_xres.Type)
+    {
+        ExpressionResultToAx(rhs_xres);
+        PushReg(SREG_AX);
+    }
 
     // Parse LHS (moves the cursor to end of LHS, so save it and restore it afterwards)
     size_t const end_of_rhs_cursor = _src.GetCursor();
     ExpressionResult lhs_xres;
     ParseAssignment_ReadLHSForModification(lhs, lhs_xres);
+
+    if ((kKW_AssignPlus == ass_symbol || kKW_AssignMinus == ass_symbol) &&
+        _sym.IsDelegateVartype(lhs_xres.Vartype) &&
+        rhs_xres.kTY_FunctionName == rhs_xres.Type)
+        return ParseAssignment_MAssign_Delegate(ass_symbol, lhs_xres, rhs_xres);
+
     _src.SetCursor(end_of_rhs_cursor);
 
     // Use the operator on LHS and RHS
@@ -5370,6 +5668,69 @@ AGS::Symbol AGS::Parser::ParseVartype(bool const with_dynpointer_handling)
     return vartype;
 }
 
+void AGS::Parser::ParseDelegate(Symbol const name_of_current_func)
+{
+    size_t const start_of_decl = _src.GetCursor();
+    if (kKW_NoSymbol != name_of_current_func)
+        UserError("Cannot define a 'delegate' type within a function body");
+
+    // Get return type of delegate
+    Symbol return_vartype = ParseVartype();
+
+    while (true)
+    {
+        // Get delegate vartype name
+        Symbol const delegate_vartype_name = _src.GetNext();
+
+        // Enter delegate into symbol table; check whether it already exists
+        if (_sym.IsPredefined(delegate_vartype_name))
+            UserError("Expected an identifier, found the predefined symbol '%s' instead", _sym.GetName(delegate_vartype_name).c_str());
+        if (_sym.IsFunction(delegate_vartype_name) || _sym.IsVartype(delegate_vartype_name))
+            UserError(
+                ReferenceMsgLoc("'%s' is already defined", _sym[delegate_vartype_name].Declared).c_str(),
+                _sym.GetName(delegate_vartype_name).c_str());
+        _sym.MakeEntryVartype(delegate_vartype_name);
+
+        SymbolTableEntry &entry = _sym[delegate_vartype_name];
+        entry.VartypeD->Parent = kKW_NoSymbol;
+        entry.VartypeD->Size = SIZE_OF_DYNPOINTER;
+        entry.Declared = _src.GetCursor();
+        auto &flags = entry.VartypeD->Flags;
+        flags[VTF::kDelegate] = true;
+        flags[VTF::kManaged] = true;
+        _sym.SetDeclared(delegate_vartype_name, start_of_decl);
+
+        // Stash away the known info about the signature so that we can check whether this declaration is compatible
+        std::unique_ptr<SymbolTableEntry::FunctionDesc> known_info{ _sym[delegate_vartype_name].FunctionD };
+        _sym[delegate_vartype_name].FunctionD = nullptr;
+        _sym.MakeEntryFunction(delegate_vartype_name);
+        size_t const known_declared = _sym.GetDeclared(delegate_vartype_name);
+
+        entry.FunctionD->Parameters.resize(1u);
+        entry.FunctionD->Parameters[0u].Vartype = return_vartype;
+        entry.FunctionD->Parameters[0u].Name = kKW_NoSymbol;
+        entry.FunctionD->Parameters[0u].Default = kKW_NoSymbol;
+
+        Expect(kKW_OpenParenthesis, _src.GetNext());
+        ParseFuncdecl_Paramlist(delegate_vartype_name, false);
+        ParseFuncdecl_CheckThatKnownInfoMatches(_sym.GetName(delegate_vartype_name), _sym[delegate_vartype_name].FunctionD, known_info.get(), known_declared, false);
+
+        // copy the default values from the signature into the symbol table
+        if (known_info)
+        {
+            auto &func_parameters = _sym[delegate_vartype_name].FunctionD->Parameters;
+            auto const &known_parameters = known_info->Parameters;
+            for (size_t parameters_idx = 0; parameters_idx < func_parameters.size(); ++parameters_idx)
+                func_parameters[parameters_idx].Default = known_parameters[parameters_idx].Default;
+        }
+
+        Symbol const punctuation = _src.GetNext();
+        Expect(SymbolList{ kKW_Comma, kKW_Semicolon }, punctuation);
+        if (kKW_Semicolon == punctuation)
+            break;
+    } 
+}
+
 void AGS::Parser::ParseEnum(TypeQualifierSet tqs, Symbol &struct_of_current_func, Symbol &name_of_current_func)
 {
     size_t const start_of_enum_decl = _src.GetCursor();
@@ -6478,6 +6839,8 @@ void AGS::Parser::RegisterGuard(RegisterList const &guarded_registers, std::func
     // Save the current MAR manager in case it gets clobbered and needs to be restored
     MarMgr save_mar_state(_marMgr);
 
+    // For each register that we must safeguard,
+    // remember the point in time when it was loaded last
     RegisterTracking::TickT register_set_point[CC_NUM_REGISTERS];
     for (auto it = guarded_registers.begin(); it != guarded_registers.end(); ++it)
         register_set_point[*it] = _reg_track.GetRegister(*it);
@@ -6489,7 +6852,7 @@ void AGS::Parser::RegisterGuard(RegisterList const &guarded_registers, std::func
     std::vector<size_t> pushes;
     for (auto it = guarded_registers.begin(); it != guarded_registers.end(); ++it)
         if (!_reg_track.IsValid(*it, tick_at_start))
-            pushes.push_back(*it);
+            pushes.push_back(*it); // This register was clobbered
     if (pushes.empty())
         return;
 
@@ -6512,8 +6875,8 @@ void AGS::Parser::RegisterGuard(RegisterList const &guarded_registers, std::func
         if (*it == SREG_MAR)
             _marMgr = save_mar_state; // Restore potentially clobbered MAR manager
         // We know that we're popping the same register that we've pushed,
-        // so it is safe to reset the set point to the point that was
-        // valid at the time of that push.
+        // so it is safe to reset the point in time that the register was set
+        // to the point in time that was valid at the time of the respective push.
         _reg_track.SetRegister(*it, register_set_point[*it]);
     }
 }
@@ -6574,6 +6937,11 @@ void AGS::Parser::ParseInput()
             ParseConstantDefn();
             continue;
 
+        case kKW_Delegate:
+            Parse_CheckTQSIsEmpty(tqs);
+            ParseDelegate(name_of_current_func);
+            continue;
+
         case kKW_Enum:
             Parse_CheckTQ(tqs, (name_of_current_func > 0), false);
             ParseEnum(tqs, struct_of_current_func, name_of_current_func);
@@ -6614,7 +6982,7 @@ void AGS::Parser::Parse_ReinitSymTable(size_t size_after_scanning)
     {
         SymbolTableEntry &s_entry = _sym[sym_idx];
 
-        if (_sym.IsFunction(sym_idx))
+        if (_sym.IsFunction(sym_idx) && !_sym.IsDelegateVartype(sym_idx))
         {
             s_entry.FunctionD->TypeQualifiers[TQ::kImport] = (kFT_Import == s_entry.FunctionD->Offset);
             s_entry.FunctionD->Offset = kDestinationPlaceholder;

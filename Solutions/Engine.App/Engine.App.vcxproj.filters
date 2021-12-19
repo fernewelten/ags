@@ -813,6 +813,9 @@
     <ClCompile Include="..\..\Engine\media\audio\openaldecoder.cpp">
       <Filter>Source Files\media\audio</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\Engine\ac\dynobj\cc_delegate.cpp">
+      <Filter>Source Files\ac\dynobj</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Engine\ac\asset_helper.h">
@@ -1675,6 +1678,9 @@
     </ClInclude>
     <ClInclude Include="..\..\Engine\media\audio\openaldecoder.h">
       <Filter>Header Files\media\audio</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Engine\ac\dynobj\cc_delegate.h">
+      <Filter>Header Files\ac\dynobj</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

@@ -2004,3 +2004,136 @@ TEST_F(Compile1, ReachabilityAndSwitch1)
     ASSERT_STREQ("Ok", (compile_result >= 0) ? "Ok" : msg.c_str());
     ASSERT_EQ(0, mh.GetMessages().size());
 }
+
+TEST_F(Compile1, Delegates1a)
+{
+    // Define delegate type, import delegate, export delegate
+    // call delegate, add function to delegate, remove function from delegate
+
+    char *inpl = "\
+        delegate int DelgType(float, int = 7);      \n\
+        managed delegate int DelgType(float, int);  \n\
+                                                    \n\
+        import DelgType *DelgObj;                   \n\
+        DelgType *DelgObj;                          \n\
+        export DelgObj;                             \n\
+                                                    \n\
+        int room_Load()                             \n\
+        {                                           \n\
+            DelgObj.Invoke(7.0);                    \n\
+        }                                           \n\
+                                                    \n\
+        int MyCallback(float f, int i)              \n\
+        {                                           \n\
+            return 77;                              \n\
+        }                                           \n\
+                                                    \n\
+        int game_start()                            \n\
+        {                                           \n\
+            DelgObj = new DelgType;                 \n\
+            DelgObj.Add(MyCallback);                \n\
+            DelgObj.Remove(MyCallback);             \n\
+            DelgObj.Clear();                        \n\
+        }                                           \n\
+    ";
+
+    int compile_result = cc_compile(inpl, scrip);
+    std::string msg = last_seen_cc_error();
+    ASSERT_STREQ("Ok", (compile_result >= 0) ? "Ok" : msg.c_str());
+}
+
+TEST_F(Compile1, Delegates1b)
+{
+    // Define delegate type, import delegate, export delegate
+    // call delegate, add function to delegate, remove function from delegate
+
+    char *inpl = "\
+        delegate int DelgType(float, int = 7);      \n\
+        managed delegate int DelgType(float, int);  \n\
+                                                    \n\
+        import DelgType *DelgObj;                   \n\
+        DelgType *DelgObj;                          \n\
+        export DelgObj;                             \n\
+                                                    \n\
+        int room_Load()                             \n\
+        {                                           \n\
+            return DelgObj(7.0);                    \n\
+        }                                           \n\
+                                                    \n\
+        int game_start()                            \n\
+        {                                           \n\
+            DelgObj = new DelgType;                 \n\
+            DelgObj += MyCallback;                  \n\
+            DelgObj -= MyCallback;                  \n\
+            DelgObj = null;                         \n\
+        }                                           \n\
+    ";
+
+    int compile_result = cc_compile(inpl, scrip);
+    std::string msg = last_seen_cc_error();
+    ASSERT_STREQ("Ok", (compile_result >= 0) ? "Ok" : msg.c_str());
+}
+
+TEST_F(Compile1, Delegates2a)
+{
+    // Define delegate type, import delegate, export delegate
+    // add struct function to delegate, remove struct function from delegate
+
+    char *inpl = "\
+        managed delegate int DelgType(float, int);  \n\
+                                                    \n\
+        import DelgType *DelgObj;                   \n\
+                                                    \n\
+        int room_Load()                             \n\
+        {                                           \n\
+            DelgObj.Invoke(7.0);                    \n\
+        }                                           \n\
+                                                    \n\
+        struct Struct                               \n\
+        {                                           \n\
+            import int MyCallback(float f, int i);  \n\
+        } *S;                                       \n\
+                                                    \n\
+        int game_start()                            \n\
+        {                                           \n\
+            DelgObj.Add(S.MyCallback);              \n\
+            DelgObj.Remove(S.MyCallback);           \n\
+        }                                           \n\
+    ";
+
+    int compile_result = cc_compile(inpl, scrip);
+    std::string msg = last_seen_cc_error();
+    ASSERT_STREQ("Ok", (compile_result >= 0) ? "Ok" : msg.c_str());
+}
+
+TEST_F(Compile1, Delegates2b)
+{
+    // Define delegate type, import delegate, export delegate
+    // add struct function to delegate, remove struct function from delegate
+
+    char *inpl = "\
+        managed delegate int DelgType(float, int);  \n\
+                                                    \n\
+        import DelgType *DelgObj;                   \n\
+                                                    \n\
+        int room_Load()                             \n\
+        {                                           \n\
+            return DelgObj(7.0);                    \n\
+        }                                           \n\
+                                                    \n\
+        struct Struct                               \n\
+        {                                           \n\
+            import int MyCallback(float f, int i);  \n\
+        } *S;                                       \n\
+                                                    \n\
+        int game_start()                            \n\
+        {                                           \n\
+            DelgObj += S.MyCallback;                \n\
+            DelgObj -= S.MyCallback;                \n\
+        }                                           \n\
+    ";
+
+    int compile_result = cc_compile(inpl, scrip);
+    std::string msg = last_seen_cc_error();
+    ASSERT_STREQ("Ok", (compile_result >= 0) ? "Ok" : msg.c_str());
+}

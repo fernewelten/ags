@@ -251,6 +251,7 @@
     <ClCompile Include="..\..\Engine\ac\dynobj\cc_audiochannel.cpp" />
     <ClCompile Include="..\..\Engine\ac\dynobj\cc_audioclip.cpp" />
     <ClCompile Include="..\..\Engine\ac\dynobj\cc_character.cpp" />
+    <ClCompile Include="..\..\Engine\ac\dynobj\cc_delegate.cpp" />
     <ClCompile Include="..\..\Engine\ac\dynobj\cc_dialog.cpp" />
     <ClCompile Include="..\..\Engine\ac\dynobj\cc_dynamicarray.cpp" />
     <ClCompile Include="..\..\Engine\ac\dynobj\cc_dynamicobject.cpp" />
@@ -506,6 +507,7 @@
     <ClInclude Include="..\..\Engine\ac\dynobj\cc_audiochannel.h" />
     <ClInclude Include="..\..\Engine\ac\dynobj\cc_audioclip.h" />
     <ClInclude Include="..\..\Engine\ac\dynobj\cc_character.h" />
+    <ClInclude Include="..\..\Engine\ac\dynobj\cc_delegate.h" />
     <ClInclude Include="..\..\Engine\ac\dynobj\cc_dialog.h" />
     <ClInclude Include="..\..\Engine\ac\dynobj\cc_dynamicarray.h" />
     <ClInclude Include="..\..\Engine\ac\dynobj\cc_dynamicobject.h" />

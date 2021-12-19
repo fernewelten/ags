@@ -147,6 +147,29 @@ private:
         kFx_String = FIXUP_STRING,         // code[fixup] += &strings[0]
     };
 
+    // Names of external builtin functions that this compiler generates calls for
+    class BuiltinFName  // Faux enum class for cstring literals
+    {
+    public:
+        static constexpr char *kArrayLength = "__Builtin_DynamicArrayLength";
+        static constexpr char *kDelegateAdd = "__Builtin_DelegateAdd";
+        static constexpr char *kDelegateBegin = "__Builtin_DelegateBegin";
+        static constexpr char *kDelegateClear = "__Builtin_DelegateClear";
+        static constexpr char *kDelegateEnd = "__Builtin_DelegateEnd";
+        static constexpr char *kDelegateRemove = "__Builtin_DelegateRemove";
+    };
+
+    // Names of pseudo attributes
+    class PseudoAttribute   // Faux enum class for cstring literals
+    {
+    public:
+        static constexpr char *kArrayLength = "Length";
+        static constexpr char *kDelegateAdd = "Add";
+        static constexpr char *kDelegateClear = "Clear";
+        static constexpr char *kDelegateInvoke = "Invoke";
+        static constexpr char *kDelegateRemove = "Remove";
+    };
+
     // The stack of nesting compound statements 
     class NestingStack
     {
@@ -298,6 +321,7 @@ private:
         {
             kTY_None = 0,
             kTY_AttributeName,
+            kTY_DelegateVartypeName,
             kTY_Literal,
             kTY_FunctionName,
             kTY_RunTimeValue,
@@ -560,11 +584,11 @@ private:
     // We're behind the opening '(', and any first extender parameter has already be resolved.
     void ParseFuncdecl(TypeQualifierSet tqs, Vartype return_vartype, Symbol struct_of_func, Symbol name_of_func, bool no_loop_check, bool body_follows);
 
-    // Return in 'idx' the index of the operator in the list that binds the least
-    // so that either side of it can be evaluated first. '-1' if no operator was found
+    // Return the index of the operator in the list that binds the least
+    // so that either side of it can be evaluated first. Return '-1' if no operator was found
     int IndexOfLeastBondingOperator(SrcList &expression);
 
-    // Return in 'opcode' the opcode that corresponds to the operator 'op_sym'
+    // Return the opcode that corresponds to the operator 'op_sym'
     // when its parameters have the vartypes 'vartype1' and 'vartype2', respectively.
     // Check whether the operator 'op_sym' can handle the types at all
     CodeCell GetOpcode(Symbol op_sym, Vartype vartype1, Vartype vartype2);
@@ -602,16 +626,39 @@ private:
     // We are processing a function call. General the actual function call
     void AccessData_GenerateFunctionCall(Symbol name_of_func, size_t num_args, bool func_is_import);
 
+    // Check that the parameter of delegate 'Add' etc. has a signature that matches the signature of the delegate
+    void AccessData_Delegate_CheckFuncParam(std::string const &func_name, Vartype delg, Symbol func);
+
+    void AccessData_Delegate_GenerateFuncCall(std::string const &xfunc_name, CodeLoc offset, Vartype vartype);
+
+    // Process a delegate function with one parameter
+    void AccessData_Delegate_Func1Param(std::string const &func_name, std::string const &xfunc_name, Vartype delg, SrcList &expression, ExpressionResult &xres);
+
+    // Implement 'delegate.Add(x.foo)'
+    void AccessData_Delegate_Add(Vartype delg, SrcList &expression, ExpressionResult &xres);
+
+    // Implement 'delegate.Clear()'
+    void AccessData_Delegate_Clear(SrcList &expression, ExpressionResult &xres);
+
+    // Implement 'delegate.Invoke(p1, p2, p3)'
+    void AccessData_Delegate_Invoke(Symbol delg, SrcList &expression, ExpressionResult &xres);
+
+    // Implement 'delegate.Remove(x.foo)'
+    void AccessData_Delegate_Remove(Vartype delg, SrcList &expression, ExpressionResult &xres);
+
+    void AccessData_Delegate(SrcList &expression, ExpressionResult &xres);
+
+    
     // Generate the function call for the function that returns the number of elements
     // of a dynarray.
-    void AccessData_GenerateDynarrayLengthFuncCall(ExpressionResult &xres);
+    void AccessData_DynarrayLength(ExpressionResult &xres);
 
     // We are processing a function call.
     // Get the parameters of the call and push them onto the stack.
     // Return the number of the parameters pushed
-    void AccessData_PushFunctionCallParams(Symbol name_of_func, bool func_is_import, SrcList &parameters, size_t &actual_num_args);
+    size_t AccessData_PushFunctionCallParams(Symbol name_of_func, bool func_is_import, SrcList &parameters);
 
-    // Process a function call. The parameter list begins with 'expression[1u]' (!)
+    // Process a function call or a delegate vartype invocation. The parameter list begins with 'expression[1u]' (!)
     void AccessData_FunctionCall(Symbol name_of_func, SrcList &expression, ExpressionResult &xres);
 
     // Evaluate 'vloc_lhs op_sym vloc_rhs' at compile time, return the result in 'vloc'.
@@ -662,7 +709,7 @@ private:
 
     // Parse the term given in 'expression'. Expression is a ternary 'a ? b : c'
     // 'expression' is parsed from the beginning. The term must use up 'expression' completely.
-    // If result_used == false then the calling function doesn't use the term result for calculating
+    // If 'result_used == false' then the calling function doesn't use the term result for calculating
     // This happens when a term is called for side effect only, e.g. in the statement 'i ? --foo : ++foo;'
     void ParseExpression_Ternary(size_t tern_idx, SrcList &expression, ExpressionResult &xres, bool result_used);
 
@@ -672,13 +719,13 @@ private:
 
     // Parse the term given in 'expression'. Expression begins with '('
     // 'expression' is parsed from the beginning. The term must use up 'expression' completely.
-    // If result_used == false then the calling function doesn't use the term result for calculating
+    // If 'result_used == false' then the calling function doesn't use the term result for calculating
     // This happens when a term is called for side effect only, e.g. in the statement '(--foo);'
     void ParseExpression_InParens(SrcList &expression, ExpressionResult &xres, bool result_used);
 
     // Parse the term given in 'expression'. Expression does not contain operators
     // 'expression' is parsed from the beginning. The term must use up 'expression' completely.
-    // If result_used == false then the calling function doesn't use the term result for calculating
+    // If 'result_used == false' then the calling function doesn't use the term result for calculating
     // This happens when a term is called for side effect only, e.g. in the statement '--foo;'
     void ParseExpression_NoOps(SrcList &expression, ExpressionResult &xres, bool result_used);
 
@@ -687,7 +734,7 @@ private:
 
     // Parse the term given in 'expression'.
     // 'expression' is parsed from the beginning. The term must use up 'expression' completely.
-    // If result_used == false then the calling function doesn't use the term result for calculating
+    // If 'result_used == false' then the calling function doesn't use the term result for calculating
     // This happens when a term is called for side effect only, e.g. in the statement '--foo;'
     void ParseExpression_Term(SrcList &expression, ExpressionResult &xres, bool result_used = true);
 
@@ -709,23 +756,22 @@ private:
     void ParseDelimitedExpression(SrcList &src, Symbol opener, ExpressionResult &xres);
 
     // Parse and evaluate an expression
-    // 'src' may be longer than the expression. In this case, leave src pointing to last token in expression.
+    // 'src' may be longer than the expression. In this case, leave 'src' pointing to last token in expression.
     // 'src'  is parsed from the point where the cursor is.
-
     void ParseExpression(SrcList &src, ExpressionResult &xres);
 
     // We access a variable or a component of a struct in order to read or write it.
     // This is a simple member of the struct.
     void AccessData_StructMember(Symbol component, VariableAccess access_type, bool access_via_this, SrcList &expression, ExpressionResult &xres);
 
-    // Return the symbol for the get or set function corresponding to the attribute given.
+    // Return the symbol for the get or set function that corresponds to the attribute given.
     Symbol ConstructAttributeFuncName(Symbol attribsym, bool is_setter, bool is_indexed);
 
-    // We call the getter or setter of an attribute
+    // Call the getter or setter of an attribute
     void AccessData_CallAttributeFunc(bool is_setter, SrcList &expression, Vartype vartype);
 
     // Memory location contains a pointer to another address. Get that address.
-    void AccessData_Dereference(ExpressionResult &xres);
+    void AccessData_Dereference(ExpressionResult &xres, bool runtime_null_check = true);
 
     // Process one index in a sequence of array indexes
     void AccessData_ProcessCurrentArrayIndex(size_t idx, size_t dim, size_t factor, bool is_dynarray, SrcList &expression);
@@ -792,13 +838,18 @@ private:
     // We are parsing the left hand side of a '+=' or similar statement.
     void ParseAssignment_ReadLHSForModification(SrcList &lhs, ExpressionResult &xres);
 
+    void ParseAssignment_Assign_Delegate(ExpressionResult const &lhs_xres, ExpressionResult const &rhs_xres);
+
     // "var = expression"; 'lhs' is the variable
     void ParseAssignment_Assign(SrcList &lhs);
 
-    // We compile something like 'var += expression'
+    // 'var += func' or 'var += s.func' or similar
+    void ParseAssignment_MAssign_Delegate(Symbol ass_symbol, ExpressionResult const &lhs_xres, ExpressionResult const &rhs_xres);
+
+    // 'var += expression' or similar
     void ParseAssignment_MAssign(Symbol ass_symbol, SrcList &lhs);
 
-    // 'const int foo = 77;'
+    // 'const int foo = 77;' or similar
     void ParseConstantDefn();
 
     void ParseVardecl_InitialValAssignment_IntOrFloatVartype(Vartype var, std::vector<char> &initial_val);
@@ -896,6 +947,12 @@ private:
     // Parse an enum declaration, possibly followed by vars of this new enum
     void ParseEnum(TypeQualifierSet tqs, Symbol &struct_of_current_func, Symbol &name_of_current_function);
 
+    // Parse a delegate declaration
+    void ParseDelegate(Symbol name_of_current_function);
+
+    // Parse an attribute declaration outside a struct
+    void ParseAttribute(TypeQualifierSet tqs, Symbol name_of_current_function);
+
     // Read a vartype (that must already be defined at this point)
     // This is either a vartype name or 'const string'
     Symbol ParseVartype(bool with_dynpointer_handling = true);
@@ -922,8 +979,6 @@ private:
     void ParseVartype_FuncDecl(TypeQualifierSet tqs, Vartype vartype, Symbol struct_name, Symbol func_name, bool no_loop_check, Symbol &struct_of_current_func, Symbol &name_of_current_func, bool &body_follows);
 
     void ParseVartype_VarDecl_PreAnalyze(Symbol var_name, ScopeType scope_type);
-
-    void ParseAttribute(TypeQualifierSet tqs, Symbol name_of_current_func);
 
     void ParseVartype_VariableDefn(TypeQualifierSet tqs, Vartype vartype, Symbol var_name, ScopeType scope_type);
 
@@ -1068,6 +1123,9 @@ private:
 
     // Blank out all imports that haven't been referenced
     void Parse_BlankOutUnusedImports();
+
+    // Declare the external import function 'name'. Returns its symbol.
+    Symbol DeclareExternalImportFunction(std::string const &name, Vartype vt1 = kKW_Void, Vartype vt2 = kKW_Void, Vartype vt3 = kKW_Void, Vartype vt4 = kKW_Void);
 
     // Enter msg into message handler, throw exception
     void Error(bool is_internal, std::string const &message);

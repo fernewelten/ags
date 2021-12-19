@@ -319,6 +319,7 @@ AGS::SymbolTable::SymbolTable()
     AddKeyword(kKW_Const, "const");
     AddKeyword(kKW_Continue, "continue");
     AddKeyword(kKW_Default, "default");
+    AddKeyword(kKW_Delegate, "delegate");
     AddKeyword(kKW_Do, "do");
     AddKeyword(kKW_Else, "else");
     AddKeyword(kKW_Enum, "enum");
@@ -367,6 +368,15 @@ AGS::SymbolTable::SymbolTable()
         entries[float_zero_sym].LiteralD->Value = 0;
         entries[float_zero_sym].LiteralD->Vartype = kKW_Float;
     }
+
+    // These symbols  are free to be used, except that
+    // they have a reserved meaning in specific contexts
+    Add("Add");         // Adds a function to a delegate object
+    Add("Clear");       // Removes all functions from a delegate object
+    Add("Invoke");      // Calls all the functions in a delegate
+    Add("Length");      // Gets the length of a dynamic array
+    Add("Remove");      // Removes a function from a delegate object
+    
     _lastAllocated = VartypeWith(VTT::kConst, kKW_String);
 }
 
